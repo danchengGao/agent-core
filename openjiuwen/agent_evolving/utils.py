@@ -7,17 +7,17 @@ Includes parameter validation, case/message/template serialization,
 JSON/list parsing from LLM outputs, and skill trace inference helpers.
 """
 
-import re
 import json
+import re
 from dataclasses import dataclass
-from typing import Optional, List, Dict, Any, Union, Iterable
+from typing import Any, Dict, Iterable, List, Optional, Union
 
-from openjiuwen.core.common.logging import logger
+from openjiuwen.agent_evolving.dataset import Case, EvaluatedCase
 from openjiuwen.core.common.exception.codes import StatusCode
 from openjiuwen.core.common.exception.errors import build_error
+from openjiuwen.core.common.logging import logger
+from openjiuwen.core.foundation.llm import AssistantMessage, BaseMessage
 from openjiuwen.core.foundation.prompt import PromptTemplate
-from openjiuwen.core.foundation.llm import BaseMessage, AssistantMessage
-from openjiuwen.agent_evolving.dataset import Case, EvaluatedCase
 
 _LEGACY_SKILL_MD_RE = re.compile(r"[/\\]([^/\\]+)[/\\]SKILL\.md", re.IGNORECASE)
 _SKILLS_PATH_RE = re.compile(r"[/\\]skills[/\\]([^/\\]+)(?=[/\\])", re.IGNORECASE)
@@ -79,6 +79,26 @@ def infer_skill_from_texts(
         return None
 
     return max(hits.items(), key=lambda item: item[1].ranking_key())[0]
+
+
+def parse_top_level_frontmatter(content: str) -> dict[str, str]:
+    """Parse only top-level scalar fields from Markdown frontmatter."""
+    text = content.strip()
+    if not text.startswith("---"):
+        return {}
+    end = text.find("---", 3)
+    if end == -1:
+        return {}
+
+    frontmatter: dict[str, str] = {}
+    for line in text[3:end].strip().split("\n"):
+        if not line or line[0].isspace() or line.startswith("-"):
+            continue
+        if ":" not in line:
+            continue
+        key, _, value = line.partition(":")
+        frontmatter[key.strip()] = value.strip()
+    return frontmatter
 
 
 def _extract_skill_tool_name(payload: Any) -> str:

@@ -2,12 +2,13 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2025. All rights reserved.
 
 from abc import abstractmethod, ABC
-from typing import Any, Tuple, List
+from typing import Any
 
 from openjiuwen.core.foundation.llm import Model
-from openjiuwen.core.memory.common.crypto import encrypt, decrypt, NONCE_LENGTH, TAG_LENGTH
 
 from openjiuwen.core.memory.manage.mem_model.memory_unit import BaseMemoryUnit
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import BaseError, build_error, raise_error
 from openjiuwen.core.common.logging import memory_logger
 from openjiuwen.core.common.logging.events import LogEventType
 
@@ -18,8 +19,67 @@ class BaseMemoryManager(ABC):
     Managing a specific type of memory data.
     """
 
-    NONCE_HEX_LENGTH = NONCE_LENGTH * 2  # hex_length = bytes_length * 2
-    TAG_HEX_LENGTH = TAG_LENGTH * 2  # hex_length = bytes_length * 2
+    def _validate_required_params(
+        self,
+        user_id: str,
+        scope_id: str,
+        memory_index: Any,
+        status_code: StatusCode,
+        memory_type: str,
+    ) -> None:
+        """
+        Validate required parameters for memory operations.
+        Raises BaseError if any required parameter is missing.
+
+        Args:
+            user_id: User identifier, must not be empty
+            scope_id: Scope identifier, must not be empty
+            memory_index: Memory index instance, must not be None
+            status_code: StatusCode to use for error reporting
+            memory_type: Memory type for error context
+        """
+        if not user_id:
+            raise build_error(
+                status_code,
+                memory_type=memory_type,
+                error_msg="user_id is required",
+            )
+        if not scope_id:
+            raise build_error(
+                status_code,
+                memory_type=memory_type,
+                error_msg="scope_id is required",
+            )
+        if not memory_index:
+            raise build_error(
+                status_code,
+                memory_type=memory_type,
+                error_msg="memory_index is not initialized",
+            )
+
+    def _wrap_exception(
+        self,
+        e: Exception,
+        status_code: StatusCode,
+        memory_type: str,
+    ) -> None:
+        """
+        Wrap exception into unified BaseError.
+        If the exception is already a BaseError, re-raise it directly.
+
+        Args:
+            e: Original exception
+            status_code: StatusCode to use for error reporting
+            memory_type: Memory type for error context
+        """
+        if isinstance(e, BaseError):
+            raise e
+        raise_error(
+            status_code,
+            memory_type=memory_type,
+            error_msg=str(e),
+            cause=e,
+        )
 
     @abstractmethod
     async def add_memories(self, user_id: str, scope_id: str, memories: dict[str, list[BaseMemoryUnit]],
@@ -57,54 +117,39 @@ class BaseMemoryManager(ABC):
         if not key or not plaintext:
             return plaintext
 
+        from openjiuwen.core.common.security.crypt_utils import CryptUtils
+
+        crypt = CryptUtils.get_crypt(CryptUtils.AES_GCM_CRYPT_NAME)
+        if not crypt:
+            return plaintext
+
         try:
-            encrypt_memory, nonce, tag = encrypt(key=key, plaintext=plaintext)
-            return f"{nonce}{tag}{encrypt_memory}"
-        except ValueError as e:
-            memory_logger.warning(
-                "Encrypt exception occurred",
-                exception=str(e),
-                event_type=LogEventType.MEMORY_PROCESS,
-            )
-            return ""
+            return crypt.encrypt(key, plaintext)
         except Exception as e:
             memory_logger.warning(
-                "Encrypt error occurred",
+                "Encrypt error via crypt",
                 exception=str(e),
                 event_type=LogEventType.MEMORY_PROCESS,
             )
-            return ""
+            return plaintext
 
     @staticmethod
     def decrypt_memory_if_needed(key: bytes, ciphertext: str) -> str:
         if not key or not ciphertext:
             return ciphertext
 
-        nonce_and_tag_len = BaseMemoryManager.NONCE_HEX_LENGTH + BaseMemoryManager.TAG_HEX_LENGTH
-        if len(ciphertext) < nonce_and_tag_len:
-            memory_logger.warning(
-                "Decryption error occurred: invalid ciphertext",
-                event_type=LogEventType.MEMORY_PROCESS,
-                metadata={"ciphertext_len": len(ciphertext)}
-            )
-            return ""
+        from openjiuwen.core.common.security.crypt_utils import CryptUtils
 
-        nonce = ciphertext[0:BaseMemoryManager.NONCE_HEX_LENGTH]
-        tag = ciphertext[BaseMemoryManager.NONCE_HEX_LENGTH:nonce_and_tag_len]
-        encrypt_memory = ciphertext[nonce_and_tag_len:]
+        crypt = CryptUtils.get_crypt(CryptUtils.AES_GCM_CRYPT_NAME)
+        if not crypt:
+            return ciphertext
+
         try:
-            return decrypt(key=key, ciphertext=encrypt_memory, nonce=nonce, tag=tag)
-        except ValueError as e:
-            memory_logger.warning(
-                "Decrypt exception occurred",
-                event_type=LogEventType.MEMORY_PROCESS,
-                exception=str(e)
-            )
-            return ""
+            return crypt.decrypt(key, ciphertext)
         except Exception as e:
             memory_logger.warning(
-                "Decrypt error occurred",
+                "Decrypt error via crypt",
+                exception=str(e),
                 event_type=LogEventType.MEMORY_PROCESS,
-                exception=str(e)
             )
-            return ""
+            return ciphertext
