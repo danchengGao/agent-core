@@ -64,7 +64,7 @@ async def standalone_invoke_context(
     3. Binds the session to *runtime*.
     4. Yields ``(session, session_id)`` to the caller.
     5. In the ``finally`` block: unbinds, cleans up the message bus, and
-       calls ``session.post_run()``.
+       closes the stream and commits the session checkpoint.
 
     When *session* is already a :class:`Session` (Runner path), the context
     manager is a no-op wrapper - it just yields the existing session so the
@@ -96,7 +96,8 @@ async def standalone_invoke_context(
         if not caller_owns:
             runtime.unbind_team_session(sid)
             await runtime.cleanup_session(sid)
-            await team_session.post_run()
+            await team_session.close_stream()
+            await team_session.commit()
 
 
 async def standalone_stream_context(
@@ -162,7 +163,8 @@ async def standalone_stream_context(
             if not caller_owns:
                 runtime.unbind_team_session(sid)
                 await runtime.cleanup_session(sid)
-                await team_session.post_run()
+                await team_session.close_stream()
+                await team_session.commit()
             else:
                 # Runner owns lifecycle; just signal end-of-stream.
                 await team_session.close_stream()

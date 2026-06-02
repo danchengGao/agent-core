@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import os
+import pathlib
 import time
 from dataclasses import dataclass
 from typing import (
@@ -20,8 +21,9 @@ from openjiuwen.core.sys_operation import SysOperation
 from openjiuwen.harness.prompts.tools import build_tool_card
 from openjiuwen.harness.tools.base_tool import ToolOutput
 from openjiuwen.harness.tools.shell.powershell._output import (
-    persist_large_output,
-    truncate_output,
+    CommandOutput,
+    render_partial_on_failure,
+    render_tool_content,
 )
 from openjiuwen.harness.tools.shell.powershell._permission import (
     check_permission,
@@ -32,9 +34,12 @@ from openjiuwen.harness.tools.shell.powershell._security import (
     check_injection,
     get_destructive_warning,
 )
-from openjiuwen.harness.tools.shell.powershell._semantics import (
-    interpret_exit_code,
-    is_silent,
+from openjiuwen.harness.tools.shell.powershell._semantics import interpret_exit_code
+from openjiuwen.core.session import get_current_session
+from openjiuwen.harness.tools.filesystem import (
+    _detect_and_record_deletions,
+    _parse_ps_remove_targets,
+    _record_rm_targets_before_deletion,
 )
 
 
@@ -70,6 +75,7 @@ class PowerShellTool(Tool):
             deny_patterns=PermissionConfig.compile_patterns(deny_patterns),
             allow_patterns=PermissionConfig.compile_patterns(allow_patterns),
         )
+        self._agent_id = agent_id or "default"
 
     @staticmethod
     def _resolve_timeout(raw_value: Any, default: int = 300) -> int:
@@ -86,6 +92,22 @@ class PowerShellTool(Tool):
         return max(1, min(timeout, max_timeout))
 
     @staticmethod
+    def _resolve_max_output_chars(raw_value: Any, default: int = 0) -> int:
+        """Parse and validate a max_output_chars value. 0 means no limit."""
+        try:
+            value = int(raw_value)
+        except (TypeError, ValueError):
+            value = default
+        if value == 0:
+            return 0
+        try:
+            max_chars = int(os.getenv("POWER_SHELL_TOOL_MAX_OUTPUT_CHARS") or "20000")
+        except ValueError:
+            max_chars = 20000
+        max_chars = max(200, max_chars)
+        return max(200, min(value, max_chars))
+
+    @staticmethod
     def _parse_inputs(inputs: Dict[str, Any]) -> _PowerShellInputs:
         """Parse and clamp tool inputs."""
         return _PowerShellInputs(
@@ -93,8 +115,16 @@ class PowerShellTool(Tool):
             timeout=PowerShellTool._resolve_timeout(inputs.get("timeout", 300)),
             workdir=inputs.get("workdir", ""),
             background=bool(inputs.get("background", False)),
-            max_output_chars=max(200, min(int(inputs.get("max_output_chars", 8000)), 20000)),
+            max_output_chars=PowerShellTool._resolve_max_output_chars(inputs.get("max_output_chars", 0)),
             description=inputs.get("description", ""),
+        )
+
+    def _build_history_path(self, session: Any) -> str:
+        from openjiuwen.core.sys_operation.cwd import get_cwd, get_workspace
+        base_dir = get_workspace() or str(pathlib.Path(get_cwd()).expanduser().resolve())
+        return os.path.join(
+            base_dir, ".agent_history",
+            f"file_ops_{self._agent_id}_{session.get_session_id()}.json",
         )
 
     async def invoke(self, inputs: Dict[str, Any], **kwargs: Any) -> ToolOutput:
@@ -128,6 +158,15 @@ class PowerShellTool(Tool):
                 return ToolOutput(success=False, error=res.message)
             return ToolOutput(success=True, data={"pid": res.data.pid, "status": "started"})
 
+        # ── pre-execution: record explicit Remove-Item targets ────
+        _session = get_current_session()
+        _history_path: Optional[str] = None
+        if _session is not None:
+            _history_path = self._build_history_path(_session)
+            ps_targets = _parse_ps_remove_targets(p.command)
+            if ps_targets:
+                await _record_rm_targets_before_deletion(_history_path, ps_targets, self._operation)
+
         res = await self._operation.shell().execute_cmd(
             p.command,
             cwd=resolved_cwd,
@@ -135,6 +174,22 @@ class PowerShellTool(Tool):
             shell_type="powershell",
         )
         if res.code != StatusCode.SUCCESS.code:
+            # A post-launch failure (e.g. timeout) still carries output collected
+            # before the kill in res.data; surface it instead of dropping it.
+            partial = None
+            if res.data is not None:
+                partial = render_partial_on_failure(
+                    CommandOutput(
+                        stdout=res.data.stdout or "",
+                        stderr=res.data.stderr or "",
+                        exit_code=res.data.exit_code if res.data.exit_code is not None else -1,
+                        warning=warning,
+                        max_output_chars=p.max_output_chars,
+                    ),
+                    res.message,
+                )
+            if partial is not None:
+                return ToolOutput(success=False, data={"content": partial}, error=partial)
             return ToolOutput(success=False, error=res.message)
 
         exit_code = res.data.exit_code if res.data else -1
@@ -142,26 +197,25 @@ class PowerShellTool(Tool):
         stderr = (res.data.stderr or "") if res.data else ""
 
         meaning = interpret_exit_code(p.command, exit_code, stdout, stderr)
-        silent = is_silent(p.command)
 
-        persisted_path: str | None = None
-        persisted_size: int | None = None
-        if len(stdout) + len(stderr) > p.max_output_chars:
-            persisted_path, persisted_size = persist_large_output(stdout, stderr)
+        # ── post-execution: cross-reference history for missed deletions ──
+        if _history_path is not None and not meaning.is_error:
+            await _detect_and_record_deletions(_history_path)
 
+        content, is_error = render_tool_content(
+            CommandOutput(
+                stdout=stdout,
+                stderr=stderr,
+                exit_code=exit_code,
+                warning=warning,
+                max_output_chars=p.max_output_chars,
+            ),
+            meaning.is_error,
+        )
         return ToolOutput(
-            success=not meaning.is_error,
-            data={
-                "stdout": truncate_output(stdout, p.max_output_chars),
-                "stderr": truncate_output(stderr, p.max_output_chars),
-                "exit_code": exit_code,
-                "return_code_interpretation": meaning.message,
-                "no_output_expected": silent,
-                "destructive_warning": warning,
-                "persisted_output_path": persisted_path,
-                "persisted_output_size": persisted_size,
-            },
-            error=truncate_output(stderr, p.max_output_chars) if meaning.is_error else None,
+            success=not is_error,
+            data={"content": content},
+            error=content if is_error else None,
         )
 
     async def stream(self, inputs: Dict[str, Any], **kwargs: Any) -> AsyncIterator[ToolOutput]:
@@ -186,6 +240,15 @@ class PowerShellTool(Tool):
 
         if p.description:
             sys_operation_logger.debug("PowerShellTool(stream): %s - %s", p.description, p.command)
+
+        # ── pre-execution: record explicit Remove-Item targets ────
+        _session = get_current_session()
+        _history_path: Optional[str] = None
+        if _session is not None:
+            _history_path = self._build_history_path(_session)
+            ps_targets = _parse_ps_remove_targets(p.command)
+            if ps_targets:
+                await _record_rm_targets_before_deletion(_history_path, ps_targets, self._operation)
 
         start = time.monotonic()
         accumulated_stdout = ""
@@ -226,20 +289,25 @@ class PowerShellTool(Tool):
                 },
             )
 
+        # ── post-execution: cross-reference history for missed deletions ──
         meaning = interpret_exit_code(p.command, final_exit_code, accumulated_stdout, accumulated_stderr)
-        silent = is_silent(p.command)
+        if _history_path is not None and not meaning.is_error:
+            await _detect_and_record_deletions(_history_path)
+
+        content, is_error = render_tool_content(
+            CommandOutput(
+                stdout=accumulated_stdout,
+                stderr=accumulated_stderr,
+                exit_code=final_exit_code,
+                warning=warning,
+                max_output_chars=p.max_output_chars,
+            ),
+            meaning.is_error,
+        )
         yield ToolOutput(
-            success=not meaning.is_error,
-            data={
-                "stdout": truncate_output(accumulated_stdout, p.max_output_chars),
-                "stderr": truncate_output(accumulated_stderr, p.max_output_chars),
-                "exit_code": final_exit_code,
-                "return_code_interpretation": meaning.message,
-                "no_output_expected": silent,
-                "destructive_warning": warning,
-                "elapsed_time_seconds": round(time.monotonic() - start, 2),
-            },
-            error=truncate_output(accumulated_stderr, p.max_output_chars) if meaning.is_error else None,
+            success=not is_error,
+            data={"content": content},
+            error=content if is_error else None,
         )
 
     def _guard(self, p: _PowerShellInputs):

@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import json
 from pathlib import Path
 from typing import Any, List, Optional, Dict
 from os import PathLike
@@ -34,6 +35,25 @@ from openjiuwen.harness.workspace.workspace import Workspace
 from openjiuwen.harness.prompts import resolve_language
 from openjiuwen.harness.prompts.tools.task_tool import GENERAL_PURPOSE_AGENT_DESC
 from openjiuwen.harness.tools import is_free_search_enabled
+
+
+def _collect_disabled_skills_from_state(skills_dirs: list[str]) -> list[str]:
+    """Read skills_state.json from each skills_dir and collect disabled skill names."""
+    disabled: set[str] = set()
+    for skills_dir in skills_dirs:
+        state_path = Path(skills_dir) / "skills_state.json"
+        if not state_path.is_file():
+            continue
+        try:
+            data = json.loads(state_path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            logger.warning("Failed to read skills_state.json at %s", state_path)
+            continue
+        skill_configs = data.get("skill_configs", {})
+        for name, cfg in skill_configs.items():
+            if isinstance(cfg, dict) and cfg.get("enabled") is False:
+                disabled.add(name)
+    return sorted(disabled)
 
 
 def _is_disabled_free_search_tool(tool: Tool | ToolCard) -> bool:
@@ -155,6 +175,7 @@ def create_deep_agent(
     prompt_mode: Optional[str] = None,
     vision_model_config: Optional[VisionModelConfig] = None,
     audio_model_config: Optional[AudioModelConfig] = None,
+    enable_read_image_multimodal: bool = True,
     enable_task_planning: bool = False,
     restrict_to_work_dir: bool = True,
     default_mode: AgentMode = AgentMode.NORMAL,
@@ -196,6 +217,9 @@ def create_deep_agent(
         audio_model_config: Shared audio-model
             configuration injected into all audio
             tools registered by DeepAgent rails.
+        enable_read_image_multimodal: When True, read_file attaches image bytes
+            as native multimodal input. When False, read_file returns image
+            metadata only and suggests using vision tools if available.
         enable_task_planning: Enable task_planning_rail.
         restrict_to_work_dir: If True, restrict file access to workspace directory.
             If False, allow access to any path including system root.
@@ -273,6 +297,7 @@ def create_deep_agent(
         prompt_mode=prompt_mode,
         vision_model_config=vision_model_config,
         audio_model_config=audio_model_config,
+        enable_read_image_multimodal=enable_read_image_multimodal,
         enable_async_subagent=enable_async_subagent,
         add_general_purpose_agent=add_general_purpose_agent,
         default_mode=default_mode,
@@ -320,9 +345,11 @@ def create_deep_agent(
         # exist — SkillUseRail skips missing directories at refresh time.
         for _team_id, target_path in workspace_obj.list_team_links():
             skills_dirs.append(str(Path(target_path) / "skills"))
+        disabled_skills = _collect_disabled_skills_from_state(skills_dirs)
         return SkillUseRail(
             skills_dir=skills_dirs,
-            skill_mode="all"
+            skill_mode="all",
+            disabled_skills=disabled_skills or None,
         )
 
     def _make_task_planning_rail() -> TaskPlanningRail:

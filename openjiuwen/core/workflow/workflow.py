@@ -64,7 +64,7 @@ from openjiuwen.core.workflow.base import (
 )
 from openjiuwen.core.workflow.components.base import ComponentAbility
 from openjiuwen.core.workflow.components.component import ComponentComposable
-from openjiuwen.core.workflow.workflow_config import WorkflowConfig
+from openjiuwen.core.workflow.workflow_config import WorkflowConfig, ExceptionConfig
 from openjiuwen.core.common.background_tasks import BackgroundTask, create_background_task
 from openjiuwen.core.runner.callback import trigger
 from openjiuwen.core.runner.callback.events import WorkflowEvents
@@ -172,7 +172,10 @@ class Workflow(metaclass=_WorkflowMeta):
             outputs_schema: dict | Transformer = None,
             stream_inputs_schema: dict | Transformer = None,
             stream_outputs_schema: dict | Transformer = None,
-            comp_ability: list[ComponentAbility] = None
+            comp_ability: list[ComponentAbility] = None,
+            max_retries: int = 0,
+            timeout: float = -1.0,
+            exception_config: ExceptionConfig = None,
     ) -> Self:
         """
         Add a component to the workflow graph.
@@ -186,6 +189,9 @@ class Workflow(metaclass=_WorkflowMeta):
             stream_inputs_schema: Schema for streaming inputs
             stream_outputs_schema: Schema for streaming outputs
             comp_ability: List of component capabilities (streaming, batching, etc.)
+            max_retries: Maximum number of retries on failure (default: 0, no retry)
+            timeout: Per-node execution timeout in seconds (<=0 means no timeout)
+            exception_config: Exception handling configuration for error recovery
 
         Returns:
             Self for method chaining
@@ -197,7 +203,10 @@ class Workflow(metaclass=_WorkflowMeta):
                                          outputs_schema=outputs_schema,
                                          stream_inputs_schema=stream_inputs_schema,
                                          stream_outputs_schema=stream_outputs_schema,
-                                         comp_ability=comp_ability)
+                                         comp_ability=comp_ability,
+                                         max_retries=max_retries,
+                                         timeout=timeout,
+                                         exception_config=exception_config)
         return self
 
     def set_end_comp(

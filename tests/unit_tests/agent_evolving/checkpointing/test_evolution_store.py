@@ -5,6 +5,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import io
+import tarfile
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -14,10 +18,13 @@ import pytest
 from openjiuwen.agent_evolving.checkpointing import EvolutionStore
 from openjiuwen.agent_evolving.checkpointing.store_records import StoreRecordsHelper
 from openjiuwen.agent_evolving.checkpointing.types import (
+    EvolutionLog,
     EvolutionPatch,
     EvolutionRecord,
     EvolutionTarget,
 )
+from openjiuwen.core.common.exception.codes import StatusCode
+from openjiuwen.core.common.exception.errors import BaseError, build_error
 
 
 def make_record(
@@ -28,6 +35,7 @@ def make_record(
     content: str = "fix issue",
     merge_target: str | None = None,
     applied: bool = False,
+    summary: str | None = None,
 ) -> EvolutionRecord:
     return EvolutionRecord(
         id=record_id,
@@ -42,6 +50,7 @@ def make_record(
             merge_target=merge_target,
         ),
         applied=applied,
+        summary=summary,
     )
 
 
@@ -50,6 +59,22 @@ def prepare_skill(root: Path, name: str, content: str = "# Skill\n\n## Troublesh
     skill_dir.mkdir(parents=True, exist_ok=True)
     (skill_dir / "SKILL.md").write_text(content, encoding="utf-8")
     return skill_dir
+
+
+def write_invalid_evolution_log(
+    fallback_write: Callable[[Path, str], Awaitable[None]],
+) -> Callable[[Path, str], Awaitable[None]]:
+    async def write_file(path: Path, content: str) -> None:
+        if "evolutions.json" in path.name:
+            path.write_text("{not-json", encoding="utf-8")
+            return
+        await fallback_write(path, content)
+
+    return write_file
+
+
+def assert_no_files(path: Path, pattern: str = "*") -> None:
+    assert not path.exists() or not any(path.glob(pattern))
 
 
 class TestEvolutionStoreBasics:
@@ -84,8 +109,50 @@ class TestEvolutionStoreBasics:
         assert await store.read_skill_content("skill-a") == "# A"
         assert await store.read_skill_content("missing") == ""
 
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_strict_read_requires_skill_md_definition(tmp_path: Path):
+        root = tmp_path / "skills"
+        skill_dir = root / "skill-a"
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "README.md").write_text("# fallback", encoding="utf-8")
+
+        store = EvolutionStore(str(root))
+
+        assert store.skill_exists("skill-a") is True
+        assert store.skill_definition_exists("skill-a") is False
+        assert await store.read_skill_content("skill-a") == "# fallback"
+        with pytest.raises(BaseError) as exc_info:
+            await store.read_skill_content("skill-a", strict=True)
+        assert exc_info.value.status == StatusCode.TOOLCHAIN_EVOLVING_SKILL_DEFINITION_NOT_FOUND
+
 
 class TestEvolutionStoreLogCRUD:
+    @staticmethod
+    def test_record_summary_serializes_and_old_json_remains_compatible():
+        patch = EvolutionPatch(
+            section="Troubleshooting",
+            action="append",
+            content="Check CSV inputs",
+            target=EvolutionTarget.BODY,
+        )
+        record = EvolutionRecord.make(
+            source="execution_failure",
+            context="ctx",
+            change=patch,
+            summary="Check CSV encoding and delimiters before parsing.",
+        )
+
+        payload = record.to_dict()
+        restored = EvolutionRecord.from_dict(payload)
+        legacy_payload = dict(payload)
+        legacy_payload.pop("summary")
+        legacy = EvolutionRecord.from_dict(legacy_payload)
+
+        assert payload["summary"] == "Check CSV encoding and delimiters before parsing."
+        assert restored.summary == "Check CSV encoding and delimiters before parsing."
+        assert legacy.summary is None
+
     @staticmethod
     @pytest.mark.asyncio
     async def test_load_full_log_handles_invalid_json(tmp_path: Path):
@@ -131,6 +198,90 @@ class TestEvolutionStoreLogCRUD:
         evo_log = await store.load_evolution_log("skill-a")
         assert [item.id for item in evo_log.entries] == ["ev_new"]
         assert evo_log.entries[0].change.content == "new"
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_append_record_rolls_back_log_on_failure(tmp_path: Path):
+        root = tmp_path / "skills"
+        prepare_skill(root, "skill-a")
+        store = EvolutionStore(str(root))
+        store.write_file_text = write_invalid_evolution_log(store.write_file_text)
+
+        with pytest.raises(BaseError) as exc_info:
+            await store.append_record("skill-a", make_record("ev_1"))
+        assert exc_info.value.status == StatusCode.TOOLCHAIN_EVOLVING_SKILL_STORE_EXECUTION_ERROR
+
+        evo_log = await store.load_evolution_log("skill-a")
+        assert evo_log.entries == []
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_append_record_rolls_back_script_file_and_keeps_payload(tmp_path: Path):
+        root = tmp_path / "skills"
+        prepare_skill(root, "skill-a")
+        store = EvolutionStore(str(root))
+        record = make_record(
+            "ev_script",
+            target=EvolutionTarget.SCRIPT,
+            section="Scripts",
+            content="print('new')",
+        )
+        record.change.script_language = "python"
+        original_content = record.change.content
+        store.write_file_text = write_invalid_evolution_log(store.write_file_text)
+
+        with pytest.raises(BaseError) as exc_info:
+            await store.append_record("skill-a", record)
+        assert exc_info.value.status == StatusCode.TOOLCHAIN_EVOLVING_SKILL_STORE_EXECUTION_ERROR
+
+        scripts_dir = root / "skill-a" / "evolution" / "scripts"
+        assert_no_files(scripts_dir, "*.py")
+        assert record.change.content == original_content
+        assert record.change.script_filename is None
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_append_record_rolls_back_projection_on_failure(tmp_path: Path):
+        root = tmp_path / "skills"
+        skill_dir = prepare_skill(root, "skill-a")
+        original_skill_md = (skill_dir / "SKILL.md").read_text(encoding="utf-8")
+        store = EvolutionStore(str(root))
+        original_write_file_text = store.write_file_text
+
+        async def fail_skill_md_projection(path: Path, content: str) -> None:
+            if path.name == "SKILL.md":
+                raise build_error(
+                    StatusCode.TOOLCHAIN_EVOLVING_SKILL_STORE_EXECUTION_ERROR,
+                    error_msg="projection failed",
+                )
+            await original_write_file_text(path, content)
+
+        store.write_file_text = fail_skill_md_projection
+
+        with pytest.raises(BaseError) as exc_info:
+            await store.append_record("skill-a", make_record("ev_1"))
+        assert exc_info.value.status == StatusCode.TOOLCHAIN_EVOLVING_SKILL_STORE_EXECUTION_ERROR
+
+        evo_log = await store.load_evolution_log("skill-a")
+        assert evo_log.entries == []
+        assert (skill_dir / "SKILL.md").read_text(encoding="utf-8") == original_skill_md
+        assert_no_files(skill_dir / "evolution", "*.md")
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_save_evolution_log_raises_when_readback_is_invalid_json(tmp_path: Path):
+        root = tmp_path / "skills"
+        prepare_skill(root, "skill-a")
+        store = EvolutionStore(str(root))
+
+        async def write_invalid_json(path: Path, content: str) -> None:
+            path.write_text("{not-json", encoding="utf-8")
+
+        store.write_file_text = write_invalid_json
+
+        with pytest.raises(BaseError, match="read back") as exc_info:
+            await store.save_evolution_log("skill-a", EvolutionLog.empty("skill-a"))
+        assert exc_info.value.status == StatusCode.TOOLCHAIN_EVOLVING_SKILL_STORE_EXECUTION_ERROR
 
 
 class TestEvolutionStoreFormatting:
@@ -210,6 +361,18 @@ class TestEvolutionStoreSysOperationPath:
 
         await store.write_file_text(tmp_path / "x.txt", "hello")
         fs_mock.write_file.assert_awaited_once()
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_write_file_text_raises_on_sys_operation_failure(tmp_path: Path):
+        store = EvolutionStore(str(tmp_path))
+        fs_mock = MagicMock()
+        fs_mock.write_file = AsyncMock(return_value=SimpleNamespace(code=1, message="disk full"))
+        store.sys_operation = SimpleNamespace(fs=lambda: fs_mock)
+
+        with pytest.raises(BaseError, match="disk full") as exc_info:
+            await store.write_file_text(tmp_path / "x.txt", "hello")
+        assert exc_info.value.status == StatusCode.TOOLCHAIN_EVOLVING_SKILL_STORE_EXECUTION_ERROR
 
     @staticmethod
     @pytest.mark.asyncio
@@ -317,7 +480,6 @@ class TestEvolutionStoreConcurrentSafety:
         records = [make_record(f"ev_{i}", content=f"record {i}") for i in range(10)]
 
         # Run 10 concurrent appends
-        import asyncio
         await asyncio.gather(*[store.append_record("skill-a", r) for r in records])
 
         evo_log = await store.load_full_evolution_log("skill-a")
@@ -338,7 +500,6 @@ class TestEvolutionStoreConcurrentSafety:
         rec_b = make_record("ev_b", content="record b")
 
         # Both should complete without deadlock
-        import asyncio
         await asyncio.gather(
             store.append_record("skill-a", rec_a),
             store.append_record("skill-b", rec_b),
@@ -418,12 +579,14 @@ class TestEvolutionStoreRenderMarkdown:
         assert "Evolution Experiences" in skill_md
         assert "**1**" in skill_md
         assert "Use this section as an index of lessons learned from previous executions." in skill_md
-        assert "For narrative guidance, read the relevant `evolution/*.md` detail file." in skill_md
-        assert "### Highlighted Evolution Records" in skill_md
+        assert "For narrative guidance, read the relevant `evolution/*.md#...` detail section." in skill_md
+        assert "### Experience Index" in skill_md
+        assert "| Summary | Type | Score | Detail |" in skill_md
+        assert "body fix" in skill_md
+        assert "[evolution/troubleshooting.md#ev_1](evolution/troubleshooting.md#ev_1)" in skill_md
+        assert "### Highlighted Evolution Records" not in skill_md
         assert "### Top Experiences" not in skill_md
-        assert "### Narrative Guidance" in skill_md
-        assert "evolution/troubleshooting.md" in skill_md
-        assert "Read: `evolution/troubleshooting.md`" in skill_md
+        assert "### Narrative Guidance" not in skill_md
 
     @staticmethod
     @pytest.mark.asyncio
@@ -447,10 +610,51 @@ class TestEvolutionStoreRenderMarkdown:
         skill_md = (root / "skill-a" / "SKILL.md").read_text(encoding="utf-8")
         assert "Scripts are implementation aids, not mandatory steps." in skill_md
         assert "### Script Assets" in skill_md
+        assert "### Experience Index" not in skill_md
         assert "### Narrative Guidance" not in skill_md
         assert "evolution/scripts/_index.md" in skill_md
-        assert "source: `evolution/scripts/validate_csv.py`" in skill_md
-        assert "Review: `evolution/scripts/_index.md`" in skill_md
+        assert "[evolution/scripts/validate_csv.py](evolution/scripts/validate_csv.py)" in skill_md
+        assert "CSV validation helper" in skill_md
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_full_experience_index_includes_low_score_records_and_anchors(tmp_path: Path):
+        root = tmp_path / "skills"
+        prepare_skill(root, "skill-a", "# Skill A\n\nSome content\n")
+        store = EvolutionStore(str(root))
+
+        low = make_record(
+            "ev_low",
+            target=EvolutionTarget.BODY,
+            section="Troubleshooting",
+            content="### Legacy title\n- details",
+            summary="Use explicit retry budget before rerunning flaky tools.",
+        )
+        low.score = 0.2
+        high = make_record(
+            "ev_high",
+            target=EvolutionTarget.DESCRIPTION,
+            section="Instructions",
+            content="# Match this skill when users mention audits\n- details",
+        )
+        high.score = 0.9
+        await store.append_record("skill-a", low)
+        await store.append_record("skill-a", high)
+
+        skill_md = (root / "skill-a" / "SKILL.md").read_text(encoding="utf-8")
+        troubleshooting = (root / "skill-a" / "evolution" / "troubleshooting.md").read_text(encoding="utf-8")
+        instructions = (root / "skill-a" / "evolution" / "instructions.md").read_text(encoding="utf-8")
+
+        assert "Use explicit retry budget before rerunning flaky tools." in skill_md
+        assert "| 0.20 | [evolution/troubleshooting.md#ev_low](evolution/troubleshooting.md#ev_low) |" in skill_md
+        assert "Match this skill when users mention audits" in skill_md
+        assert "[evolution/instructions.md#ev_high](evolution/instructions.md#ev_high)" in skill_md
+        assert '<a id="ev_low"></a>' in troubleshooting
+        assert "### [ev_low] Use explicit retry budget before rerunning flaky tools." in troubleshooting
+        assert "### Legacy title" in troubleshooting
+        assert "- details" in troubleshooting
+        assert '<a id="ev_high"></a>' in instructions
+        assert "### [ev_high] Match this skill when users mention audits" in instructions
 
     @staticmethod
     @pytest.mark.asyncio
@@ -502,6 +706,24 @@ class TestEvolutionStoreRecordMaintenance:
 
     @staticmethod
     @pytest.mark.asyncio
+    async def test_merge_and_update_clear_stale_summary(tmp_path: Path):
+        root = tmp_path / "skills"
+        prepare_skill(root, "skill-a")
+        store = EvolutionStore(str(root))
+
+        await store.append_record("skill-a", make_record("ev_1", content="one", summary="old one summary"))
+        await store.append_record("skill-a", make_record("ev_2", content="two", summary="old two summary"))
+
+        merged = await store.merge_records("skill-a", "ev_1", ["ev_2"], "merged content")
+        updated = await store.update_record_content("skill-a", "ev_1", "updated content")
+
+        assert merged is not None
+        assert merged.summary is None
+        assert updated is not None
+        assert updated.summary is None
+
+    @staticmethod
+    @pytest.mark.asyncio
     async def test_update_record_scores_and_get_records_by_score(tmp_path: Path):
         root = tmp_path / "skills"
         prepare_skill(root, "skill-a")
@@ -529,6 +751,41 @@ class TestEvolutionStoreRecordMaintenance:
         assert [record.id for record in ranked] == ["ev_low", "ev_high"]
         assert ranked[0].usage_stats.times_presented == 3
         assert ranked[0].usage_stats.times_used == 2
+
+
+class TestPackSkillForSharing:
+    @staticmethod
+    def _read_tar_skill_md(package_bytes: bytes) -> str:
+        with tarfile.open(fileobj=io.BytesIO(package_bytes), mode="r:gz") as archive:
+            for member in archive.getmembers():
+                if member.name.endswith("SKILL.md"):
+                    extracted = archive.extractfile(member)
+                    assert extracted is not None
+                    return extracted.read().decode("utf-8")
+        raise AssertionError("SKILL.md not found in package")
+
+    @staticmethod
+    @pytest.mark.asyncio
+    async def test_pack_skill_for_sharing_omits_evolution_index_block(tmp_path: Path):
+        root = tmp_path / "skills"
+        prepare_skill(root, "skill-a", "# Skill A\n\nContent\n")
+        store = EvolutionStore(str(root))
+
+        await store.append_record(
+            "skill-a",
+            make_record("ev_1", content="body fix", summary="check bounds"),
+        )
+
+        local_skill_md = (root / "skill-a" / "SKILL.md").read_text(encoding="utf-8")
+        assert "evolution-index-start" in local_skill_md
+
+        package = await store.pack_skill_for_sharing("skill-a")
+        packed_skill_md = TestPackSkillForSharing._read_tar_skill_md(package)
+
+        assert "evolution-index-start" not in packed_skill_md
+        assert "evolution-index-end" not in packed_skill_md
+        assert "Experience Index" not in packed_skill_md
+        assert "# Skill A" in packed_skill_md
 
 
 class TestEvolutionStoreArchiveAndCreate:

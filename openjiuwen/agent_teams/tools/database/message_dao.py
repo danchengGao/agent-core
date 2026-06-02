@@ -60,8 +60,8 @@ class MessageDao:
         """
         message_model = _get_message_model()
         for attempt in range(_DB_RETRY_ATTEMPTS):
-            async with self._session_local() as session:
-                try:
+            try:
+                async with self._session_local() as session:
                     message = message_model(
                         message_id=message_id,
                         team_name=team_name,
@@ -74,30 +74,31 @@ class MessageDao:
                     )
                     session.add(message)
                     await session.commit()
-                    team_logger.info("Message %s created", message_id)
-                    return True
-                except IntegrityError as e:
-                    await session.rollback()
-                    team_logger.error("Failed to create %s, reason is %s", message_id, e)
+                team_logger.info("Message %s created", message_id)
+                return True
+            except IntegrityError as e:
+                team_logger.error("Failed to create %s, reason is %s", message_id, e)
+                return False
+            except OperationalError as e:
+                # Connection has been released by ``async with`` __aexit__ above;
+                # the back-off sleep below must stay outside that block, otherwise
+                # the pool sees a leaked checkout and concurrent writers eventually
+                # hit ``QueuePool ... timed out``.
+                if attempt >= _DB_RETRY_ATTEMPTS - 1:
+                    team_logger.error(
+                        "Failed to create message %s after %d attempts: %s",
+                        message_id,
+                        _DB_RETRY_ATTEMPTS,
+                        e,
+                    )
                     return False
-                except OperationalError as e:
-                    await session.rollback()
-                    if attempt < _DB_RETRY_ATTEMPTS - 1:
-                        delay = _DB_RETRY_BASE_DELAY * (2**attempt)
-                        team_logger.warning(
-                            "Database locked on create_message (attempt %d), retrying in %ss",
-                            attempt + 1,
-                            delay,
-                        )
-                        await asyncio.sleep(delay)
-                    else:
-                        team_logger.error(
-                            "Failed to create message %s after %d attempts: %s",
-                            message_id,
-                            _DB_RETRY_ATTEMPTS,
-                            e,
-                        )
-                        return False
+                delay = _DB_RETRY_BASE_DELAY * (2**attempt)
+                team_logger.warning(
+                    "Database locked on create_message (attempt %d), retrying in %ss",
+                    attempt + 1,
+                    delay,
+                )
+                await asyncio.sleep(delay)
         return False
 
     async def get_messages(
@@ -179,7 +180,7 @@ class MessageDao:
             rows = result.scalars().all()
             return rows
 
-    async def has_unread_messages(self, team_name: str) -> bool:
+    async def has_unread_messages(self, team_name: str, *, include_broadcast: bool = True) -> bool:
         """Return True if any team message is still unread by its intended reader.
 
         Direct messages: unread when ``is_read`` is False. Broadcast messages:
@@ -189,6 +190,16 @@ class MessageDao:
         ``is_read`` as-is — messages addressed to consumer-less members (the
         ``user`` pseudo-member, human_agent) are marked read on write or
         auto-acked by the leader, so they do not block completion.
+
+        Args:
+            team_name: Team identifier.
+            include_broadcast: When False, only direct (point-to-point)
+                messages count toward the unread check; the broadcast
+                watermark comparison is skipped. Defaults to True to keep
+                the original behavior.
+
+        Returns:
+            True if at least one matching message has not been read.
         """
         message_model = _get_message_model()
         read_status_model = _get_message_read_status_model()
@@ -205,6 +216,9 @@ class MessageDao:
             )
             if direct_unread.first() is not None:
                 return True
+
+            if not include_broadcast:
+                return False
 
             # Broadcast messages: per-member watermark comparison.
             broadcast_result = await session.execute(

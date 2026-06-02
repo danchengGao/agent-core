@@ -24,9 +24,9 @@ DESCRIPTION: Dict[str, str] = {
         "工作目录在命令之间保持不变，但 Shell 状态（变量、函数、alias）不保留。"
         "Shell 环境从用户的 profile（bash 或 zsh）初始化。\n"
         "\n"
-        "Windows 注意：`cmd` 自带 `mkdir` **不支持 `-p`**，不要在 cmd/PowerShell 中使用 `mkdir -p`。"
-        "本工具按 Bash 语义执行时（默认/`shell_type=bash`，Windows 上常为 Git Bash），POSIX `mkdir` **支持 `-p`**。"
-        "只有 `shell_type=cmd` 或 `shell_type=powershell` 时，才改用 `New-Item ... -Force` 或逐级 `mkdir`。\n"
+        "Windows 注意：`cmd`/PowerShell 自带 `mkdir` **不支持 `-p`**，不要在 cmd/PowerShell 中使用 `mkdir -p`。"
+        "只有运行环境信息显示 Git Bash 或非 WSL stub 的 PATH bash 可用，并且实际使用 bash/Git Bash 时，POSIX `mkdir -p` 才适用。"
+        "否则应使用 PowerShell `New-Item ... -Force` 或 cmd 逐级 `mkdir`。\n"
         "\n"
         "重要：避免使用本工具执行 `find`、`grep`、`cat`、`head`、`tail`、"
         "`sed`、`awk` 或 `echo` 命令，除非明确指示或确认专用工具无法完成任务。"
@@ -65,6 +65,9 @@ DESCRIPTION: Dict[str, str] = {
         "只在确实必要时使用\n"
         "   - 除非用户明确要求，不要跳过 hooks（--no-verify）"
         "或绕过签名（--no-gpg-sign）。hook 失败时应排查并修复根本原因\n"
+        "   - 用户分享代码仓 URL 让你「看看这个仓库」或「分析一下」时，"
+        "首选动作是 `git clone <url> <本地路径>`；克隆完再用 read_file/grep/glob "
+        "等专用工具读源码，比抓取仓库主页能拿到的信息完整得多\n"
         " - 避免不必要的 `sleep` 命令：\n"
         "   - 能立即执行的命令之间不要 sleep\n"
         "   - 长时间运行的命令使用 `run_in_background: true`，"
@@ -82,11 +85,11 @@ DESCRIPTION: Dict[str, str] = {
         "(variables, functions, aliases) does not. The shell environment "
         "is initialized from the user's profile (bash or zsh).\n"
         "\n"
-        "Windows note: `cmd`'s `mkdir` **does not support `-p`**; do not use "
-        "`mkdir -p` in cmd/PowerShell. When this tool runs with Bash semantics "
-        "(default/`shell_type=bash`, often Git Bash on Windows), POSIX `mkdir` "
-        "**supports `-p`**. Only with `shell_type=cmd` or `shell_type=powershell`, "
-        "use `New-Item ... -Force` or create each level with `mkdir`.\n"
+        "Windows note: `cmd`/PowerShell `mkdir` **does not support `-p`**; do not use "
+        "`mkdir -p` in cmd/PowerShell. POSIX `mkdir -p` is appropriate only when "
+        "the runtime environment information shows Git Bash or a non-WSL-stub PATH bash "
+        "is available and you are actually using bash/Git Bash. Otherwise, use "
+        "PowerShell `New-Item ... -Force` or create each level with cmd `mkdir`.\n"
         "\n"
         "IMPORTANT: Avoid using this tool to run `find`, `grep`, `cat`, "
         "`head`, `tail`, `sed`, `awk`, or `echo` commands, unless "
@@ -145,6 +148,11 @@ DESCRIPTION: Dict[str, str] = {
         "   - Never skip hooks (--no-verify) or bypass signing "
         "(--no-gpg-sign) unless the user has explicitly asked for it. "
         "If a hook fails, investigate and fix the underlying issue.\n"
+        "   - When a user shares a repo URL and asks you to 'look at' "
+        "or 'analyze' it, the natural first step is "
+        "`git clone <url> <local_path>`; after cloning, use "
+        "read_file/grep/glob on the working tree - it gives you far "
+        "more than the rendered repository page would.\n"
         " - Avoid unnecessary `sleep` commands:\n"
         "   - Do not sleep between commands that can run immediately "
         "-- just run them.\n"
@@ -238,20 +246,21 @@ BASH_PARAMS: Dict[str, Dict[str, str]] = {
         ),
     },
     "max_output_chars": {
-        "cn": "最大输出字符数，默认 8000（上限 20000），防止超大输出撑爆上下文",
+        "cn": "最大输出字符数，0 表示不限制（默认）；非零时上限 20000，防止超大输出撑爆上下文",
         "en": (
-            "Max output characters, default 8000 (max 20000), "
-            "prevents oversized output from flooding context"
+            "Max output characters; 0 (default) means no limit; "
+            "non-zero values are capped at 20000 to prevent oversized output from flooding context"
         ),
     },
     "shell_type": {
         "cn": (
             "指定 Shell 类型，可选值：auto/cmd/powershell/bash/sh，默认 auto。cmd/PowerShell 不支持 `mkdir -p`；"
-            "需要该语法时保持 auto/bash/sh。"
+            "只有环境信息显示 Git Bash 或非 WSL stub 的 PATH bash 可用时，才对 POSIX 语法使用 auto/bash/sh。"
         ),
         "en": (
             "Shell to use: auto/cmd/powershell/bash/sh, default auto. cmd/PowerShell do not support `mkdir -p`; "
-            "keep auto/bash/sh when you need that syntax."
+            "use auto/bash/sh for POSIX syntax only when the environment information shows Git Bash or a "
+            "non-WSL-stub PATH bash is available."
         ),
     },
 }

@@ -136,6 +136,7 @@ class DeepAgent(BaseAgent):
         self._initialized = False
         self.system_prompt_builder: Optional[SystemPromptBuilder] = None
         self._invoke_active: bool = False
+        self._stream_process_task: Optional[asyncio.Task] = None
         self._auto_invoke_scheduled: bool = False
         self._bound_session_id: Optional[str] = None
         self._session_toolkit: SessionToolkit | None = None
@@ -1009,6 +1010,15 @@ class DeepAgent(BaseAgent):
                     **create_kwargs,
                     **dict(spec.factory_kwargs or {}),
                 )
+            if normalized_factory in {"mobile_gui_agent", "mobile_agent"}:
+                from openjiuwen.harness.subagents.mobile_gui_agent import (
+                    create_mobile_gui_agent,
+                )
+
+                return create_mobile_gui_agent(
+                    **create_kwargs,
+                    **dict(spec.factory_kwargs or {}),
+                )
 
             raise build_error(
                 StatusCode.DEEPAGENT_CREATE_SUBAGENT_NOT_FOUND,
@@ -1096,6 +1106,35 @@ class DeepAgent(BaseAgent):
     def _is_resume_input(invoke_inputs: InvokeInputs) -> bool:
         """Return True if the query is an InteractiveInput (interrupt resume)."""
         return isinstance(invoke_inputs.query, InteractiveInput)
+
+    @staticmethod
+    def _result_from_stream_chunk(chunk: Any, output_parts: List[str]) -> Optional[Dict[str, Any]]:
+        """Build an invoke-style result from emitted stream chunks."""
+        chunk_type = getattr(chunk, "type", None)
+        payload = getattr(chunk, "payload", None)
+        if isinstance(chunk, dict):
+            chunk_type = chunk.get("type", chunk_type)
+            payload = chunk.get("payload", payload)
+
+        if not isinstance(payload, dict):
+            return None
+
+        result: Optional[Dict[str, Any]] = None
+        if chunk_type == "llm_output":
+            content = payload.get("content")
+            if isinstance(content, str):
+                output_parts.append(content)
+        elif chunk_type == "answer":
+            result = dict(payload)
+            result.setdefault("result_type", "answer")
+            if "output" not in result:
+                content = result.get("content")
+                if isinstance(content, str):
+                    output_parts.append(content)
+                    result["output"] = content
+                else:
+                    result = None
+        return result
 
     def add_rail(self, rail: AgentRail) -> "DeepAgent":
         """Synchronously queue a rail for registration.
@@ -1275,10 +1314,12 @@ class DeepAgent(BaseAgent):
                     for d in resources.skills.dirs
                 ]
             # Try appending to existing SkillUseRail
+            # Check both _registered_rails (already initialized) and
+            # _pending_rails (queued during configure() but not yet initialized)
             existing_skill_rail: (
                 SkillUseRail | None
             ) = None
-            for r in self._registered_rails:
+            for r in (*self._registered_rails, *self._pending_rails):
                 if isinstance(r, SkillUseRail):
                     existing_skill_rail = r
                     break
@@ -1301,6 +1342,11 @@ class DeepAgent(BaseAgent):
                         *existing,
                     ]
                 existing_skill_rail.enable_cache = False
+                # Ensure sys_operation is set for reading SKILL.md files
+                if existing_skill_rail.sys_operation is None:
+                    existing_skill_rail.set_sys_operation(
+                        self.deep_config.sys_operation
+                    )
                 await existing_skill_rail.reload_skills()
             else:
                 mode = (
@@ -2155,24 +2201,22 @@ class DeepAgent(BaseAgent):
                 await session.close_stream()
 
         task = asyncio.create_task(_stream_process())
-
-        _stream_task = task
+        self._stream_process_task = task
         try:
             async for chunk in session.stream_iterator():
                 yield chunk
 
             # Normal completion: wait for background task
-            await _stream_task
+            await task
         except asyncio.CancelledError:
             # Cancel background task explicitly to speed up cleanup.
-            # Without this, await _stream_task could wait for a long-running
+            # Without this, await task could wait for a long-running
             # operation (e.g., wait_round_completion with 600s timeout).
-            _stream_task.cancel()
-            try:
-                await _stream_task
-            except asyncio.CancelledError:
-                pass  # Expected when we cancelled it
+            await self._cancel_stream_process_task()
             raise
+        finally:
+            if self._stream_process_task is task:
+                self._stream_process_task = None
 
     async def _write_round_result_to_stream(
         self,
@@ -2283,6 +2327,8 @@ class DeepAgent(BaseAgent):
 
         self._invoke_active = True
         try:
+            stream_result: Optional[Dict[str, Any]] = None
+            stream_output_parts: List[str] = []
             async with ctx.lifecycle(
                 AgentCallbackEvent.BEFORE_INVOKE,
                 AgentCallbackEvent.AFTER_INVOKE,
@@ -2295,12 +2341,30 @@ class DeepAgent(BaseAgent):
                     async for chunk in self._run_task_loop_stream(
                         ctx, session, stream_modes
                     ):
+                        chunk_result = self._result_from_stream_chunk(
+                            chunk, stream_output_parts
+                        )
+                        if chunk_result is not None:
+                            stream_result = chunk_result
                         yield chunk
                 else:
                     async for chunk in self._run_single_round_stream(
                         ctx, session, stream_modes
                     ):
+                        chunk_result = self._result_from_stream_chunk(
+                            chunk, stream_output_parts
+                        )
+                        if chunk_result is not None:
+                            stream_result = chunk_result
                         yield chunk
+
+                if stream_result is None and stream_output_parts:
+                    stream_result = {
+                        "output": "".join(stream_output_parts),
+                        "result_type": "answer",
+                    }
+                if stream_result is not None:
+                    invoke_inputs.result = stream_result
 
             if session is not None:
                 self.save_state(session)
@@ -2372,6 +2436,22 @@ class DeepAgent(BaseAgent):
             self.card.id, sess, event
         )
 
+    async def _cancel_stream_process_task(self) -> None:
+        """Cancel the in-flight task-loop stream background task, if any."""
+        task = self._stream_process_task
+        if task is None or task.done():
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception:
+            logger.debug(
+                "stream process task raised during cancel",
+                exc_info=True,
+            )
+
     async def abort(
         self,
         session: Optional[Session] = None,
@@ -2380,7 +2460,10 @@ class DeepAgent(BaseAgent):
 
         Sets the abort flag on the coordinator and
         calls on_abort() on the event handler so the
-        outer loop can exit promptly.
+        outer loop can exit promptly. Also cancels the
+        background ``_stream_process`` task when streaming,
+        so consumer disconnect / interrupt stops promptly
+        instead of leaving a zombie ReAct loop running.
 
         Args:
             session: Current session (unused).
@@ -2388,14 +2471,14 @@ class DeepAgent(BaseAgent):
         _ = session
         coordinator = self._loop_coordinator
         controller = self._loop_controller
-        if coordinator is None or controller is None:
-            return
-        coordinator.request_abort()
-        handler = cast(
-            TaskLoopEventHandler,
-            controller.event_handler,
-        )
-        await handler.on_abort()
+        if coordinator is not None and controller is not None:
+            coordinator.request_abort()
+            handler = cast(
+                TaskLoopEventHandler,
+                controller.event_handler,
+            )
+            await handler.on_abort()
+        await self._cancel_stream_process_task()
 
 
 __all__ = [

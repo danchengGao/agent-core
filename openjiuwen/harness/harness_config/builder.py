@@ -21,7 +21,7 @@ from openjiuwen.harness.harness_config.loader import ResolvedFileSection, Resolv
 from openjiuwen.harness.workspace.workspace import Workspace
 
 if TYPE_CHECKING:
-    pass
+    from openjiuwen.harness.deep_agent import DeepAgent
 
 # ---------------------------------------------------------------------------
 # Builtin tool group registry
@@ -34,7 +34,7 @@ _BUILTIN_TOOL_GROUPS: Dict[str, Tuple[str, List[str], bool]] = {
         ["ReadFileTool", "WriteFileTool", "EditFileTool", "ListDirTool", "GlobTool", "GrepTool"],
         True,
     ),
-    "shell": ("openjiuwen.harness.tools.bash", ["BashTool"], True),
+    "shell": ("openjiuwen.harness.tools.shell", ["BashTool"], True),
     "code": ("openjiuwen.harness.tools.code", ["CodeTool"], True),
     "web_search": (
         "openjiuwen.harness.tools.web_tools",

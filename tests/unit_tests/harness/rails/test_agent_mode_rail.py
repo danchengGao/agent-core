@@ -8,6 +8,7 @@ from types import SimpleNamespace
 from unittest import IsolatedAsyncioTestCase
 from unittest.mock import Mock, patch
 
+from openjiuwen.harness.prompts.sections.agent_mode import build_plan_mode_section
 from openjiuwen.harness.rails import AgentModeRail
 from openjiuwen.harness.schema.state import DeepAgentState
 
@@ -62,6 +63,28 @@ def _make_ctx(tool_name: str, *, mode: str = "plan", tool_args=None, tools=None)
 
 
 class TestAgentModeRail(IsolatedAsyncioTestCase):
+    async def test_build_plan_mode_section_ignores_legacy_prompt_context(self) -> None:
+        state = DeepAgentState()
+        state.plan_mode.mode = "plan"
+        state.plan_mode.prompt_context = "team"
+        agent = Mock()
+        agent.load_state.return_value = state
+        agent.get_plan_file_path.return_value = None
+        session = SimpleNamespace()
+
+        section = build_plan_mode_section(
+            "en",
+            "",
+            False,
+            agent=agent,
+            session=session,
+        )
+
+        content = section.content["en"]
+        self.assertIn("Plan mode is active", content)
+        self.assertNotIn("Team.plan mode is active", content)
+        self.assertNotIn("build_team", content)
+
     async def test_before_tool_call_passes_through_when_not_plan_mode(self) -> None:
         rail, ctx, _ = _make_ctx("some_random_tool", mode="auto")
 
@@ -85,6 +108,41 @@ class TestAgentModeRail(IsolatedAsyncioTestCase):
 
         self.assertTrue(ctx.extra.get("_skip_tool"))
         self.assertIn("not available in plan mode", ctx.inputs.tool_result["error"])
+
+    async def test_before_tool_call_rejects_git_pull_in_plan_mode(self) -> None:
+        rail, ctx, _ = _make_ctx(
+            "bash",
+            mode="plan",
+            tool_args={"command": "git pull origin main"},
+        )
+        await rail.before_tool_call(ctx)
+        self.assertTrue(ctx.extra.get("_skip_tool"))
+        self.assertIn("Git write operations are blocked in plan mode", ctx.inputs.tool_result["error"])
+
+
+    async def test_before_tool_call_rejects_git_add_in_plan_mode(self) -> None:
+        rail, ctx, _ = _make_ctx(
+            "bash",
+            mode="plan",
+            tool_args={"command": "git add ."},
+        )
+
+        await rail.before_tool_call(ctx)
+
+        self.assertTrue(ctx.extra.get("_skip_tool"))
+        self.assertIn("Git write operations are blocked in plan mode", ctx.inputs.tool_result["error"])
+
+    async def test_before_tool_call_allows_git_status_in_plan_mode(self) -> None:
+        rail, ctx, _ = _make_ctx(
+            "bash",
+            mode="plan",
+            tool_args={"command": "git status"},
+        )
+
+        await rail.before_tool_call(ctx)
+
+        self.assertIsNone(ctx.extra.get("_skip_tool"))
+        self.assertIsNone(ctx.inputs.tool_result)
 
     async def test_before_tool_call_write_or_edit_only_plan_file(self) -> None:
         rail, ctx_bad, _ = _make_ctx(
@@ -143,13 +201,19 @@ class TestAgentModeRail(IsolatedAsyncioTestCase):
 
     async def test_after_tool_call_register_unregister_task_tool_and_respect_skip(self) -> None:
         rail, ctx_enter, agent = _make_ctx("enter_plan_mode", mode="plan")
-        with patch.object(rail, "_register_task_tool") as mock_register, patch.object(rail, "_unregister_task_tool") as mock_unregister:
+        with (
+            patch.object(rail, "_register_task_tool") as mock_register,
+            patch.object(rail, "_unregister_task_tool") as mock_unregister,
+        ):
             await rail.after_tool_call(ctx_enter)
             mock_register.assert_called_once_with(agent)
             mock_unregister.assert_not_called()
 
         rail2, ctx_exit, agent2 = _make_ctx("exit_plan_mode", mode="plan")
-        with patch.object(rail2, "_register_task_tool") as mock_register2, patch.object(rail2, "_unregister_task_tool") as mock_unregister2:
+        with (
+            patch.object(rail2, "_register_task_tool") as mock_register2,
+            patch.object(rail2, "_unregister_task_tool") as mock_unregister2,
+        ):
             await rail2.after_tool_call(ctx_exit)
             mock_unregister2.assert_called_once_with(agent2)
             mock_register2.assert_not_called()

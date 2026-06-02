@@ -3,16 +3,18 @@
 
 import os
 import base64
-import tempfile
 import shutil
+import tempfile
+import unittest
 from types import MethodType
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
 
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.sys_operation import SysOperationCard, OperationMode, LocalWorkConfig
-from openjiuwen.core.sys_operation.cwd import get_cwd, set_cwd
+from openjiuwen.core.sys_operation.cwd import get_cwd, set_cwd, set_workspace
 from openjiuwen.harness.prompts.tools.filesystem import (
     get_glob_input_params,
     get_grep_input_params,
@@ -89,6 +91,25 @@ async def test_read_file_image_returns_multimodal_payload(sys_op, temp_dir):
     assert "base64," not in read_res.data["content"]
     assert read_res.data["multimodal"][0]["type"] == "image"
     assert read_res.data["multimodal"][0]["data_url"].startswith("data:image/")
+
+
+@pytest.mark.asyncio
+async def test_read_file_image_can_disable_multimodal_payload(sys_op, temp_dir):
+    read_tool = ReadFileTool(sys_op, enable_image_multimodal=False)
+    file_path = os.path.join(temp_dir, "one_pixel.png")
+    raw = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII="
+    )
+    with open(file_path, "wb") as fh:
+        fh.write(raw)
+
+    read_res = await read_tool.invoke({"file_path": file_path})
+
+    assert read_res.success is True
+    assert "Image file read:" in read_res.data["content"]
+    assert "base64," not in read_res.data["content"]
+    assert read_res.data["multimodal"] == []
+    assert "native image multimodal input is disabled" in read_res.data["content"]
 
 
 @pytest.mark.asyncio
@@ -626,3 +647,100 @@ def test_read_file_tool_capability_flags_keep_backward_compatibility():
     assert ReadFileTool.isReadOnly() is True
     assert ReadFileTool.isConcurrencySafe() is True
     assert ReadFileTool.checkPermissions() == "allow"
+
+
+# ── history path construction ─────────────────────────────────
+
+
+class TestWriteFileToolHistoryPath(unittest.TestCase):
+    """Unit tests for WriteFileTool._build_history_path — no Runner required."""
+
+    def _make_session(self, session_id: str, agent_id: str | None = None) -> MagicMock:
+        mock = MagicMock()
+        mock.get_session_id.return_value = session_id
+        mock.agent_id.return_value = agent_id
+        return mock
+
+    def test_path_contains_agent_id_and_session_id(self):
+        """History path embeds both agent_id and session_id."""
+        session = self._make_session("sess_abc", agent_id="agent_xyz")
+        tool = WriteFileTool(MagicMock())
+        path = tool._build_history_path(session)
+        assert "agent_xyz" in path
+        assert "sess_abc" in path
+        session.get_session_id.assert_called_once()
+
+    def test_default_agent_id_used_when_none(self):
+        """session.agent_id() returning None falls back to 'default'."""
+        session = self._make_session("s1", agent_id=None)
+        tool = WriteFileTool(MagicMock())
+        path = tool._build_history_path(session)
+        assert "default" in path
+
+    def test_workspace_path_is_base_dir(self):
+        """Workspace ContextVar is used as the base directory."""
+        session = self._make_session("s1", agent_id="a")
+        workspace = tempfile.mkdtemp()
+        try:
+            set_workspace(workspace)
+            tool = WriteFileTool(MagicMock())
+            path = tool._build_history_path(session)
+            assert path.startswith(os.path.realpath(workspace))
+            assert ".agent_history" in path
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_filename_pattern(self):
+        """Filename follows file_ops_{agent_id}_{session_id}.json pattern."""
+        session = self._make_session("sess123", agent_id="myagent")
+        tool = WriteFileTool(MagicMock())
+        path = tool._build_history_path(session)
+        filename = os.path.basename(path)
+        assert filename == "file_ops_myagent_sess123.json"
+
+
+class TestEditFileToolHistoryPath(unittest.TestCase):
+    """Unit tests for EditFileTool._build_history_path — no Runner required."""
+
+    def _make_session(self, session_id: str, agent_id: str | None = None) -> MagicMock:
+        mock = MagicMock()
+        mock.get_session_id.return_value = session_id
+        mock.agent_id.return_value = agent_id
+        return mock
+
+    def test_path_contains_agent_id_and_session_id(self):
+        """History path embeds both agent_id and session_id."""
+        session = self._make_session("sess_abc", agent_id="agent_xyz")
+        tool = EditFileTool(MagicMock())
+        path = tool._build_history_path(session)
+        assert "agent_xyz" in path
+        assert "sess_abc" in path
+        session.get_session_id.assert_called_once()
+
+    def test_default_agent_id_used_when_none(self):
+        """session.agent_id() returning None falls back to 'default'."""
+        session = self._make_session("s1", agent_id=None)
+        tool = EditFileTool(MagicMock())
+        path = tool._build_history_path(session)
+        assert "default" in path
+
+    def test_workspace_path_is_base_dir(self):
+        """Workspace ContextVar is used as the base directory."""
+        session = self._make_session("s1", agent_id="a")
+        workspace = tempfile.mkdtemp()
+        try:
+            set_workspace(workspace)
+            tool = EditFileTool(MagicMock())
+            path = tool._build_history_path(session)
+            assert path.startswith(os.path.realpath(workspace))
+            assert ".agent_history" in path
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_filename_pattern(self):
+        """Filename follows file_ops_{agent_id}_{session_id}.json pattern."""
+        session = self._make_session("sess123", agent_id="myagent")
+        tool = EditFileTool(MagicMock())
+        path = tool._build_history_path(session)
+        filename = os.path.basename(path)
+        assert filename == "file_ops_myagent_sess123.json"

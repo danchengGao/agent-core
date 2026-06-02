@@ -6,7 +6,7 @@
 |---|---|
 | 类型 | spec |
 | 关联模块 | `openjiuwen/agent_teams/interaction/`、`openjiuwen/agent_teams/constants.py`、`openjiuwen/agent_teams/runtime/manager.py`（`_dispatch_payload`）、`openjiuwen/agent_teams/agent/coordination/handlers/message.py`（HITT inbound 钩子）|
-| 最近一次修订日期 | 2026-05-15 |
+| 最近一次修订日期 | 2026-05-17 |
 | 关联 feature | F_13_human-agent-send-message.md |
 
 ## 范围 / 边界
@@ -42,18 +42,19 @@
 4. **`InteractPayload` 是 dispatcher 的唯一入参形状**：`runtime/manager.py:_dispatch_payload` 只 isinstance `GodViewMessage` / `OperatorMessage` / `HumanAgentMessage` 三种。新增视角 = 新增 dataclass + 在 `_dispatch_payload` 加一支；不允许 `dict` / `**kwargs` 形式漏过去。
 5. **三视角到通道的映射唯一**：
    - `GodViewMessage` → `UserInbox.deliver_to_leader`，落到 leader DeepAgent 的 `deliver_input`，**不**写消息总线；
-   - `OperatorMessage(target=None)` → `UserInbox.broadcast`；
-   - `OperatorMessage(target=<name>)` → `UserInbox.direct`；
+   - `OperatorMessage(target=None)` → `auto_start_all()` + `UserInbox.broadcast`（先启动再广播）；
+   - `OperatorMessage(target=<name>)` → `auto_start_member(<name>)` + `UserInbox.direct`（先启动再投递）；
    - `HumanAgentMessage(target=None)` → `HumanAgentInbox._drive_agent`（驱动该 avatar 的 DeepAgent，不写总线）；
    - `HumanAgentMessage(target in {"all", "*"})` → `HumanAgentInbox` 经 `broadcast_message`；
    - `HumanAgentMessage(target=<name>)` → `HumanAgentInbox` 经 `deliver_direct`。
-   不存在第二张映射表。
+   不存在第二张映射表。`auto_start` 是 dispatch 层行为（`_dispatch_payload`），不归 inbox 层管。
 6. **入站通道总带 sender**：经 `UserInbox` 写入的总线消息一律 `from_member_name="user"`；经 `HumanAgentInbox` 写入的总线消息 `from_member_name=<已校验的 human-agent member 名>`。`from_member_name` 不允许为 `None`、不允许从 body 文本反猜。
 7. **HITT 启用是分层 AND**：`TeamAgentSpec.enable_hitt`（spec 层 capability ceiling）与 `build_team(enable_hitt=...)`（运行时实例 override）必须**两层都允许**，团队才有人类成员；spec=False 时任何运行时强行打开都被 fail-fast 拒绝。
 8. **HITT 关时 inbox 直接拒**：`HumanAgentInbox.send` 在 `team.human_agent_names()` 为空时抛 `HumanAgentNotEnabledError`（`_dispatch_payload` 转 `DeliverResult.failure("human_agent_not_enabled")`）；HITT 开但 sender 不匹配抛 `UnknownHumanAgentError`，转 `DeliverResult.failure("unknown_human_agent")`。绝不允许 silent drop 或者 silent inject 一个新身份。
 9. **保留名 `human_agent` 命中语义**：当 sender 省略时，`HumanAgentInbox._resolve_sender` 用 `HUMAN_AGENT_MEMBER_NAME` 作为优先默认；找不到则取 `sorted(names)[0]`。这是 backward-compat 兜底，不是 routing 含义。
 10. **`HumanAgentInboundEvent` 是 team→user 反向通道的唯一类型**：人类成员收到的消息（点对点 / 广播）由 `MessageHandler.on_message_or_broadcast` 把消息总线 row 包成 `HumanAgentInboundEvent`，喂给注册在 `TeamBackend` 上的 `on_inbound` 回调。**人类成员的 LLM 不消费这些消息**——按 phase-2 设计，业务层（CLI / SDK / IM 适配器）拿到事件再决定怎么投给真实用户。
-11. **interaction 层不感知 wake-up**：`UserInbox` / `HumanAgentInbox` 只调 `TeamMessageManager.send_message` / `broadcast_message` 与 `TeamAgent.deliver_input`。它们既不写 `EventBus`，也不阅读 `MemberStatus`。从消息总线到 dispatcher 的 wake-up 是 `messager` + coordination 的事，跟这一层无关。
+11. **interaction 层 inbox 不感知 wake-up**：`UserInbox` / `HumanAgentInbox` 只调 `TeamMessageManager.send_message` / `broadcast_message` 与 `TeamAgent.deliver_input`。它们既不写 `EventBus`，也不阅读 `MemberStatus`。从消息总线到 dispatcher 的 wake-up 是 `messager` + coordination 的事，跟这一层无关。
+    **注意**：`_dispatch_payload`（dispatch 层）在 OperatorMessage 分支调用 `auto_start_member` / `auto_start_all` 做 best-effort lazy startup——这是 dispatch 层行为，不是 inbox 层行为。inbox 层仍然不感知成员状态。
 12. **错误以 `DeliverResult` 为准，不抛业务态异常**：`UserInbox` / `HumanAgentInbox` 对外 contract 是同一个 `DeliverResult(ok, message_id, reason)`。HITT 相关的 `HumanAgentNotEnabledError` / `UnknownHumanAgentError` 是 inbox 内部状态信号，由 `_dispatch_payload` 在边界吃掉转换成 `failure(reason)`。SDK 用户**不需要** try/except 一个具体异常类。
 
 ## 接口契约
@@ -129,7 +130,7 @@ def parse_interact_str(body: str) -> list[InteractPayload]
 
 ```
 input := channel? recipients? body
-channel := "# " | "$" name " "    # default "# " when omitted
+channel := "# " | "$" name (" " | "@")  # default "# " when omitted; "$name@member" is legal (no space)
 recipients := ("@" name " ")*
 body := remaining text
 ```
@@ -145,6 +146,7 @@ body := remaining text
 | `# @all body` 或 `# @* body` | `[OperatorMessage(body, target=None)]`（broadcast 吞掉同时列出的具名收件人）|
 | `$<name> body` | `[HumanAgentMessage(body, sender=<name>, target=None)]` |
 | `$<name> @m body` | `[HumanAgentMessage(body, sender=<name>, target="m")]` |
+| `$<name>@m body` | `[HumanAgentMessage(body, sender=<name>, target="m")]`（`@` 紧跟 `$name` 无空格同义） |
 | `$<name> @all body` / `$<name> @* body` | `[HumanAgentMessage(body, sender=<name>, target="*")]` |
 
 行为铁律：
@@ -253,7 +255,13 @@ async def _dispatch_payload(agent: TeamAgent, payload: InteractPayload) -> Deliv
     if isinstance(payload, OperatorMessage):
         inbox = UserInbox(backend.message_manager)
         if payload.target is None:
+            # Start all UNSTARTED members before broadcasting so
+            # they subscribe to the event bus before MessageEvent.
+            await agent.auto_start_all()
             return await inbox.broadcast(payload.body)
+        # Start the targeted member before delivering so it
+        # subscribes before MessageEvent is published.
+        await agent.auto_start_member(payload.target)
         return await inbox.direct(payload.target, payload.body)
     if isinstance(payload, HumanAgentMessage):
         try:
@@ -331,7 +339,7 @@ RESERVED_MEMBER_NAMES: frozenset[str] = frozenset({
 1. `human_agent` 是保留成员名，作动态 spawn 的默认人类成员名；自定 HUMAN_AGENT 成员名可避开此保留名。普通 teammate 的 predefined 成员仍然不允许撞保留名（`_validate_reserved_names`）。
 2. human-agent 走标准 `UNSTARTED → spawn` 流程（与 teammate 一致），工具集为 `HUMAN_AGENT_TOOLS` = `view_task` + `member_complete_task` + `send_message`；rail 装配会剥离 `FirstIterationGate` / `TeamToolApprovalRail`。其中 `send_message` 是**用户驱动的转发通道**：能否调用、给谁、说什么完全由用户在 Inbox 输入里的明确指令决定。约束写在 `team_hitt` prompt section 里（不在 `invoke()` 里加 caller-role 分支）——选择 prompt 而非代码强约束是因为「该不该转发」是语义判断，最适合让 LLM 在 prompt 引导下判断；如果未来发现 LLM 越权滥用，再加 tool-level 静态护栏（如 multicast/broadcast 拒收）。
 3. 一旦 `task.assignee` 指向某个 human-agent 且状态 CLAIMED，`UpdateTaskTool` 拒绝 reassign 和 cancel；批量 cancel 链路也跳过。
-4. 发送给 human-agent 的点对点消息 `is_read=True`；广播后 human-agent 的 `read_at` 立即跟进。
+4. 发送给 human-agent 的点对点消息与广播 **保持 `is_read=False`**。human-agent 走与 teammate 一致的 `MessageHandler._process_unread_messages` poll → `deliver_input` → `mark_message_read` 路径；写入侧自动标已读会绕过 poll 路径，avatar 的 DeepAgent 就收不到消息（见 F_20）。
 5. `TeamPolicyRail` 注入 `team_hitt` section（priority=12），按 role 给 leader / teammate / human_agent 下达角色特定的行为约束。section 注入条件来自 `backend.hitt_enabled()`——反映运行时 effective flag，不依赖 roster 是否已 spawn。
 6. `_resolve_team_mode` 只把**非 HUMAN_AGENT** 的 predefined member 计入 `hybrid` 派生——所以纯 HITT 团队（仅声明人类成员）仍然是 `default` 模式，leader 保留 `spawn_member` 工具。
 

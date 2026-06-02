@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from openjiuwen.core.foundation.llm.model import Model
 
@@ -23,6 +23,9 @@ from openjiuwen.harness.security.models import PermissionsSection
 from openjiuwen.harness.workspace.workspace import (
     Workspace,
 )
+
+if TYPE_CHECKING:
+    from openjiuwen.harness.deep_agent import DeepAgent
 
 DEFAULT_OPENAI_BASE_URL = "https://api.openai.com/v1"
 DEFAULT_OPENROUTER_VISION_MODEL = "google/gemini-2.5-pro"
@@ -205,6 +208,7 @@ class DeepAgentConfig:
     prompt_mode: Optional[str] = None
     vision_model_config: Optional[VisionModelConfig] = None
     audio_model_config: Optional[AudioModelConfig] = None
+    enable_read_image_multimodal: bool = True
     rails: Optional[List[AgentRail]] = None
     enable_plan_mode: bool = False
     model_selection: Optional[Dict[Model, str]] = None

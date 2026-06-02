@@ -24,6 +24,11 @@ from openjiuwen.core.sys_operation.result import (
     ExecuteCmdResult, ExecuteCmdStreamResult, ExecuteCmdData, ExecuteCmdChunkData,
     ExecuteCmdBackgroundData, ExecuteCmdBackgroundResult
 )
+from openjiuwen.core.sys_operation.shell_process_registry import (
+    register_shell_process,
+    resolve_shell_session_id,
+    unregister_shell_process,
+)
 
 
 _POWERSHELL_TOKENS = (
@@ -45,6 +50,18 @@ _POSIX_COMMANDS = frozenset({
 })
 _QUOTED_WINDOWS_PATH_PATTERN = re.compile(r"(?P<quote>['\"])(?P<path>[A-Za-z]:\\[^'\"]+)(?P=quote)")
 _UNQUOTED_WINDOWS_PATH_PATTERN = re.compile(r"(?<![\w/])(?P<path>[A-Za-z]:\\[^\s|&;]+)")
+
+
+def _track_shell_process(proc: asyncio.subprocess.Process) -> str | None:
+    sid = resolve_shell_session_id()
+    if sid:
+        register_shell_process(sid, proc)
+    return sid
+
+
+def _untrack_shell_process(session_id: str | None, proc: asyncio.subprocess.Process) -> None:
+    if session_id:
+        unregister_shell_process(session_id, proc)
 
 
 def _looks_like_powershell(command: str) -> bool:
@@ -221,6 +238,20 @@ def _normalize_windows_paths_for_bash(command: str) -> str:
 class ShellOperation(BaseShellOperation):
     """Shell operation"""
 
+    # 已知在无 TTY 环境下会挂死的命令模式。
+    # 每个条目: (pattern, description, auto_env_overrides | None)
+    # auto_env_overrides 会在检测到时自动注入环境变量，降低挂死概率。
+    _TUI_COMMAND_PATTERNS: List[Tuple[re.Pattern, str, Optional[Dict[str, str]]]] = [
+        (re.compile(r"\b(npx\s+)?playwright\s+test\b", re.IGNORECASE),
+         "Playwright test runner may require TTY", {"CI": "true"}),
+        (re.compile(r"\b(npm|npx|yarn|pnpm)\s+(run\s+)?test\b", re.IGNORECASE),
+         "Test runner (npm/pnpm/yarn) may require TTY", {"CI": "true"}),
+        (re.compile(r"\bvitest\b.*(--watch|--ui)", re.IGNORECASE),
+         "Vitest watch/UI mode requires TTY", {"CI": "true"}),
+        (re.compile(r"\b(top|htop|vim|vi|nano|less|more)\b", re.IGNORECASE),
+         "Interactive TUI program will hang without TTY", None),
+    ]
+
     _DANGEROUS_PATTERNS: List[Tuple[re.Pattern, str]] = [
         (re.compile(r"\brm\s+-rf\b", re.IGNORECASE), "rm -rf"),
         (re.compile(r"\bdel\s+/[a-z]*[fsq][a-z]*\b", re.IGNORECASE), "del /f /s /q"),
@@ -232,6 +263,22 @@ class ShellOperation(BaseShellOperation):
         (re.compile(r"\bmkfs\b", re.IGNORECASE), "mkfs"),
         (re.compile(r"\breg\s+delete\b", re.IGNORECASE), "reg delete"),
         (re.compile(r"\bremove-item\b[^\n\r]*-recurse[^\n\r]*-force", re.IGNORECASE), "Remove-Item -Recurse -Force"),
+        (
+            re.compile(r"\bpkill\b[^\n\r;|&]*jiuwenswarm(?!-tui)", re.IGNORECASE),
+            "pkill targeting jiuwenswarm backend",
+        ),
+        (
+            re.compile(r"\bkillall\b[^\n\r;|&]*jiuwenswarm(?!-tui)", re.IGNORECASE),
+            "killall targeting jiuwenswarm backend",
+        ),
+        (
+            re.compile(r"\bpkill\b[^\n\r;|&]*jiuwenclaw", re.IGNORECASE),
+            "pkill targeting jiuwenclaw backend",
+        ),
+        (
+            re.compile(r"\bkillall\b[^\n\r;|&]*jiuwenclaw", re.IGNORECASE),
+            "killall targeting jiuwenclaw backend",
+        ),
     ]
 
     _BUFFERING_WRAPPERS: Dict[str, Callable[[str], str]] = {
@@ -334,6 +381,15 @@ class ShellOperation(BaseShellOperation):
         """
         args, use_shell, _ = self._resolve_execution_plan(command, shell_type)
 
+        # 进程组隔离：创建新 session，后续可用 os.killpg() 清理整棵进程树。
+        # 仅 POSIX 生效；Windows 通过 CREATE_NEW_PROCESS_GROUP 但语义不同，
+        # 此处保持 _kill_process_tree 的 fallback 路径。
+        subprocess_kw: dict[str, Any] = {}
+        if os.name != "nt":
+            _jw_start_new_session = os.getenv("JW_START_NEW_SESSION", "true").strip().lower()
+            if _jw_start_new_session not in ("0", "false", "no", "off"):
+                subprocess_kw["start_new_session"] = True
+
         if background:
             stdout = asyncio.subprocess.DEVNULL
             stderr = asyncio.subprocess.DEVNULL
@@ -352,6 +408,7 @@ class ShellOperation(BaseShellOperation):
                 stdin=stdin,
                 stdout=stdout,
                 stderr=stderr,
+                **subprocess_kw,
             )
         return await asyncio.create_subprocess_exec(
             *args,
@@ -360,6 +417,7 @@ class ShellOperation(BaseShellOperation):
             stdin=asyncio.subprocess.DEVNULL,
             stdout=stdout,
             stderr=stderr,
+            **subprocess_kw,
         )
 
     async def execute_cmd(
@@ -432,17 +490,32 @@ class ShellOperation(BaseShellOperation):
                 return _create_exec_cmd_err(error_msg="command not allowed by allowlist",
                                             data=ExecuteCmdData(command=command, cwd=str(actual_cwd)))
 
+            # 框架层超时上限，防止 LLM 设置过长 timeout 导致 agent 长时间无响应
+            _max_exec_cmd_timeout = int(os.getenv("JW_EXECUTE_CMD_MAX_TIMEOUT", "600"))
+            timeout = min(timeout or 300, _max_exec_cmd_timeout)
+
             exec_env = OperationUtils.prepare_environment(environment)
+            is_tui, tui_warning = self._detect_and_mitigate_tui(command, exec_env)
+            if is_tui and tui_warning:
+                sys_operation_logger.warning(
+                    tui_warning,
+                    event_type=LogEventType.SYS_OP_ERROR,
+                    metadata={"command": command[:200]},
+                )
             if os.name == "nt":
                 system_encoding = self._detect_shell_encoding()
                 if system_encoding and system_encoding.lower() not in ("utf-8", "utf8"):
                     lang_encoding = self._get_lang_encoding(system_encoding)
                     exec_env["LANG"] = f"C.{lang_encoding}"
             proc = await self._create_subprocess(command, actual_cwd, exec_env, shell_type=shell_type_enum)
+            track_sid = _track_shell_process(proc)
 
             encoding = (options or {}).get("encoding", self._detect_shell_encoding())
             process_handler = OperationUtils.create_handler(process=proc, encoding=encoding, timeout=timeout)
-            invoke_data = await process_handler.invoke()
+            try:
+                invoke_data = await process_handler.invoke()
+            finally:
+                _untrack_shell_process(track_sid, proc)
             invoke_exception = getattr(invoke_data, "exception", None)
             if isinstance(invoke_exception, asyncio.TimeoutError):
                 return _create_exec_cmd_err(f"execution timeout after {timeout} seconds",
@@ -556,7 +629,18 @@ class ShellOperation(BaseShellOperation):
                     data=ExecuteCmdChunkData(chunk_index=chunk_index, exit_code=-1))
                 return
 
+            # 框架层超时上限，防止 LLM 设置过长 timeout 导致 agent 长时间无响应
+            _max_exec_cmd_timeout = int(os.getenv("JW_EXECUTE_CMD_MAX_TIMEOUT", "600"))
+            timeout = min(timeout or 300, _max_exec_cmd_timeout)
+
             exec_env = OperationUtils.prepare_environment(environment)
+            is_tui, tui_warning = self._detect_and_mitigate_tui(command, exec_env)
+            if is_tui and tui_warning:
+                sys_operation_logger.warning(
+                    tui_warning,
+                    event_type=LogEventType.SYS_OP_ERROR,
+                    metadata={"command": command[:200]},
+                )
             if os.name == "nt":
                 system_encoding = self._detect_shell_encoding()
                 if system_encoding and system_encoding.lower() not in ("utf-8", "utf8"):
@@ -565,6 +649,7 @@ class ShellOperation(BaseShellOperation):
             process = await self._create_subprocess(
                 command, actual_cwd, exec_env, shell_type=shell_type_enum, stream=True,
             )
+            track_sid = _track_shell_process(process)
 
             chunk_size = (options or {}).get("chunk_size", 1024)
             encoding = (options or {}).get("encoding", self._detect_shell_encoding())
@@ -632,13 +717,16 @@ class ShellOperation(BaseShellOperation):
                 else:
                     return handler(stream_event_data, data_idx)
 
-            async for chunk in process_handler.stream():
-                modify_data = _stream_event_trans(chunk, chunk_index)
-                if modify_data:
-                    yield modify_data
-                    chunk_index += 1
-                if chunk.type in (StreamEventType.ERROR, StreamEventType.EXIT):
-                    return
+            try:
+                async for chunk in process_handler.stream():
+                    modify_data = _stream_event_trans(chunk, chunk_index)
+                    if modify_data:
+                        yield modify_data
+                        chunk_index += 1
+                    if chunk.type in (StreamEventType.ERROR, StreamEventType.EXIT):
+                        return
+            finally:
+                _untrack_shell_process(track_sid, process)
 
         except Exception as e:
             yield _create_exec_cmd_stream_err(error_msg=f"unexpected error: {str(e)}",
@@ -718,10 +806,12 @@ class ShellOperation(BaseShellOperation):
             process = await self._create_subprocess(
                 command, actual_cwd, exec_env, shell_type=shell_type_enum, background=True
             )
+            track_sid = _track_shell_process(process)
 
             process_handler = OperationUtils.create_handler(process=process)
             pid, err = await process_handler.background(grace=grace)
             if err:
+                _untrack_shell_process(track_sid, process)
                 return _create_exec_cmd_background_err(
                     error_msg=f"background command failed: {err}",
                     data=ExecuteCmdBackgroundData(command=command, cwd=str(actual_cwd)))
@@ -782,6 +872,23 @@ class ShellOperation(BaseShellOperation):
         if not target.is_absolute():
             target = pathlib.Path(get_cwd()) / target
         return target.resolve()
+
+    def _detect_and_mitigate_tui(self, command: str, exec_env: Dict[str, str]) -> Tuple[bool, Optional[str]]:
+        """检测 TUI/PTY 依赖命令并注入缓解环境变量。
+
+        Returns:
+            (is_tui_detected, warning_message_or_None)
+        """
+        if os.getenv("JW_TUI_DETECTION_ENABLED", "true").strip().lower() in ("0", "false", "no", "off"):
+            return False, None
+        for pattern, description, auto_env in self._TUI_COMMAND_PATTERNS:
+            if pattern.search(command):
+                if auto_env:
+                    for key, value in auto_env.items():
+                        if key not in exec_env:
+                            exec_env[key] = value
+                return True, f"TUI command detected: {description} (auto-mitigated)"
+        return False, None
 
     def _wrap_command_with_buffering(self, command: str) -> str:
         """"Wraps a command string with OS-specific buffering wrapper if available."""

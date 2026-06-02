@@ -32,7 +32,10 @@ from openjiuwen.agent_teams.interaction import (
     UnknownHumanAgentError,
     UserInbox,
 )
-from openjiuwen.agent_teams.interaction.router import parse_interact_str
+from openjiuwen.agent_teams.interaction.router import (
+    parse_interact_str,
+    resolve_targets,
+)
 from openjiuwen.agent_teams.monitor import (
     TeamMonitor,
     create_monitor,
@@ -44,6 +47,7 @@ from openjiuwen.agent_teams.runtime.dispatch import (
     decide_run_action,
 )
 from openjiuwen.agent_teams.runtime.metadata import (
+    read_team_db_state,
     read_team_names_in_session,
     read_team_namespace,
     read_teams_bucket,
@@ -66,6 +70,7 @@ from openjiuwen.core.session.agent_team import (
     create_agent_team_session,
 )
 from openjiuwen.core.session.checkpointer import CheckpointerFactory
+from openjiuwen.core.session.interaction.interactive_input import InteractiveInput
 
 if TYPE_CHECKING:
     from openjiuwen.agent_teams.agent.team_agent import TeamAgent
@@ -120,8 +125,7 @@ class TeamRuntimeManager:
         # session and stale contextvars / state cannot leak across.
         if pool_entry is not None and pool_entry.current_session_id != target_session_id:
             team_logger.info(
-                "activate: stale pool entry for team {} on session {}; "
-                "stop+remove before rebuilding on session {}",
+                "activate: stale pool entry for team {} on session {}; stop+remove before rebuilding on session {}",
                 team_name,
                 pool_entry.current_session_id,
                 target_session_id,
@@ -131,7 +135,7 @@ class TeamRuntimeManager:
                 session_id=pool_entry.current_session_id,
             )
             pool_entry = None
-        team_in_session, team_in_db = await self._inspect_session(
+        team_in_session, team_in_db, team_db_state = await self._inspect_session(
             spec,
             team_session,
             team_name,
@@ -142,6 +146,17 @@ class TeamRuntimeManager:
             pool_entry=pool_entry,
             target_session_id=target_session_id,
             target_team_name=team_name,
+            team_db_state=team_db_state,
+        )
+        team_logger.info(
+            "activate: team {} session {} dispatched to {} (in_db={}, in_session={}, db_state={}, pooled={})",
+            team_name,
+            target_session_id,
+            action.kind.value,
+            team_in_db,
+            team_in_session,
+            team_db_state,
+            pool_entry is not None,
         )
         return await self._apply_action(
             action,
@@ -176,13 +191,31 @@ class TeamRuntimeManager:
         """
         entry = await self._resolve_entry(team_name=team_name, session_id=session_id)
         if entry is None:
+            team_logger.debug(
+                "finalize: no pool entry for team {} session {}; nothing to settle",
+                team_name,
+                session_id,
+            )
             return
         agent = entry.agent
         try:
-            if await agent.is_shutdown_requested() or agent.lifecycle != "persistent":
+            shutdown_requested = await agent.is_shutdown_requested()
+            if shutdown_requested or agent.lifecycle != "persistent":
+                team_logger.info(
+                    "finalize: stopping team {} session {} (shutdown_requested={}, lifecycle={})",
+                    team_name,
+                    session_id,
+                    shutdown_requested,
+                    agent.lifecycle,
+                )
                 await agent.stop_coordination()
                 await self._pool.remove(team_name)
             else:
+                team_logger.info(
+                    "finalize: pausing persistent team {} session {}",
+                    team_name,
+                    session_id,
+                )
                 await agent.pause_coordination()
                 entry.state = RuntimeState.PAUSED
         except Exception as exc:
@@ -225,6 +258,7 @@ class TeamRuntimeManager:
         so we only tear down the kernel and skip the status write entirely.
         """
         member = agent.team_member
+        member_name = getattr(agent, "member_name", "?")
         try:
             current_status: Optional[MemberStatus] = None
             if member is not None:
@@ -236,26 +270,38 @@ class TeamRuntimeManager:
                         exc,
                     )
             already_finalized = (
-                current_status is not None
-                and current_status in TeamRuntimeManager._MEMBER_FINALIZED_STATUSES
+                current_status is not None and current_status in TeamRuntimeManager._MEMBER_FINALIZED_STATUSES
             )
             if already_finalized:
                 # External party (leader stop/pause, shutdown_self) already
                 # wrote a terminal/quiescent status. Just close the kernel.
+                team_logger.info(
+                    "finalize_member: team member {} already finalized (status={}); closing kernel only",
+                    member_name,
+                    current_status.value if current_status is not None else None,
+                )
                 await agent.stop_coordination()
                 return
             if current_status == MemberStatus.SHUTDOWN_REQUESTED:
+                team_logger.info(
+                    "finalize_member: shutting down team member {} on request",
+                    member_name,
+                )
                 await agent.stop_coordination()
                 if member is not None:
                     await member.update_status(MemberStatus.SHUTDOWN)
                 return
+            team_logger.info(
+                "finalize_member: pausing team member {}; marking READY for next assignment",
+                member_name,
+            )
             await agent.pause_coordination()
             if member is not None:
                 await member.update_status(MemberStatus.READY)
         except Exception as exc:
             team_logger.warning(
                 "Failed to finalize team member {}: {}",
-                getattr(agent, "member_name", "?"),
+                member_name,
                 exc,
             )
 
@@ -273,22 +319,29 @@ class TeamRuntimeManager:
         """
         entry = await self._resolve_entry(team_name=team_name, session_id=session_id)
         if entry is None:
+            team_logger.debug(
+                "pause: no pool entry for team {} session {}; nothing to pause",
+                team_name,
+                session_id,
+            )
             return False
         await entry.agent.pause_coordination()
         entry.state = RuntimeState.PAUSED
+        team_logger.info("pause: team {} session {} paused", team_name, session_id)
         return True
 
     async def interact(
         self,
-        payload: InteractPayload | str,
+        payload: InteractPayload | str | InteractiveInput,
         *,
         team_name: str,
         session_id: str,
     ) -> DeliverResult:
         """Route an interact payload through the active team's gate.
 
-        ``payload`` accepts either an :class:`InteractPayload` (one of
-        ``GodViewMessage`` / ``OperatorMessage`` / ``HumanAgentMessage``)
+        ``payload`` accepts an ``InteractiveInput`` for pending leader
+        interrupts, an :class:`InteractPayload` (one of
+        ``GodViewMessage`` / ``OperatorMessage`` / ``HumanAgentMessage``),
         or a free-form ``str``. String inputs are parsed by
         :func:`parse_interact_str` exactly once at this layer:
 
@@ -296,10 +349,18 @@ class TeamRuntimeManager:
         - ``$<name> body`` → :class:`HumanAgentMessage` driving that
           avatar.
         - Either form may be followed by one or more ``@<member>``
-          recipients (e.g. ``# @m1 @m2 hi``); each named recipient
+          recipients (e.g. ``# @m1 @m2 hi``); each known recipient
           becomes its own bus message and ``@all`` / ``@*`` collapses
           into a single broadcast.
         - No recognised prefix → :class:`GodViewMessage(body=payload)`.
+
+        Recipients are strict-matched against the live roster after
+        parsing (:func:`resolve_targets`). An ``@<member>`` that matches
+        no roster row is not a routing directive — its mention folds
+        back into a single no-mention message delivered to the channel
+        default (leader for ``#``, avatar for ``$``) with the original
+        text preserved, instead of writing a bus message to a
+        non-existent member.
 
         Multi-recipient inputs fan out to multiple
         ``_dispatch_payload`` calls under the same gate ticket. The
@@ -315,27 +376,71 @@ class TeamRuntimeManager:
             when the runtime is shutting down. Other failure reasons
             propagate from the underlying inbox.
         """
+        entry = await self._resolve_entry(team_name=team_name, session_id=session_id)
+        if entry is None:
+            return DeliverResult.failure("not_active")
+
+        if isinstance(payload, InteractiveInput):
+            if entry.agent.has_pending_interrupt():
+                await entry.agent.resume_interrupt(payload)
+                return DeliverResult.success(None)
+            return DeliverResult.failure("unsupported_interactive_input")
+
         if isinstance(payload, str):
             parsed = parse_interact_str(payload)
             payloads: list[InteractPayload] = parsed or [GodViewMessage(body=payload)]
         else:
             payloads = [payload]
 
-        entry = await self._resolve_entry(team_name=team_name, session_id=session_id)
-        if entry is None:
-            return DeliverResult.failure("not_active")
         ticket = await entry.interact_gate.admit()
         if ticket is None:
             return DeliverResult.failure("gate_closed")
         try:
-            last_result: DeliverResult = DeliverResult.success(None)
-            for entry_payload in payloads:
-                last_result = await self._dispatch_payload(entry.agent, entry_payload)
-                if not last_result.ok:
-                    return last_result
-            return last_result
+            # Strict-match ``@<member>`` recipients against the live
+            # roster once we hold the ticket. Unknown mentions are not
+            # routing directives — they fold back into a no-mention
+            # message for the leader / avatar instead of silently
+            # writing a bus message to a non-existent member.
+            return await self.dispatch_payloads(entry.agent, payloads)
         finally:
             await entry.interact_gate.consume_done(ticket)
+
+    @staticmethod
+    async def dispatch_payloads(
+        agent: "TeamAgent",
+        payloads: list[InteractPayload],
+    ) -> DeliverResult:
+        """Resolve and dispatch interact payloads through the runtime router."""
+        payloads = await TeamRuntimeManager._resolve_recipients(agent, payloads)
+
+        last_result: DeliverResult = DeliverResult.success(None)
+        for entry_payload in payloads:
+            last_result = await TeamRuntimeManager._dispatch_payload(agent, entry_payload)
+            if not last_result.ok:
+                return last_result
+        return last_result
+
+    @staticmethod
+    async def _resolve_recipients(
+        agent: "TeamAgent",
+        payloads: list[InteractPayload],
+    ) -> list[InteractPayload]:
+        """Validate ``@<member>`` recipients against the live roster.
+
+        Backends expose ``get_member(name) -> TeamMember | None``; we
+        adapt it to the boolean predicate :func:`resolve_targets` needs.
+        When no backend is bound (god-view-only agent), there is no
+        roster to match against and payloads pass through unchanged.
+        """
+        backend = agent.team_backend
+        if backend is None:
+            return payloads
+
+        async def _member_exists(name: str) -> bool:
+            """Roster predicate backed by the live team backend."""
+            return await backend.get_member(name) is not None
+
+        return await resolve_targets(payloads, member_exists=_member_exists)
 
     @staticmethod
     async def _dispatch_payload(agent: "TeamAgent", payload: InteractPayload) -> DeliverResult:
@@ -353,10 +458,26 @@ class TeamRuntimeManager:
         if isinstance(payload, OperatorMessage):
             inbox = UserInbox(backend.message_manager)
             if payload.target is None:
-                return await inbox.broadcast(payload.body)
-            return await inbox.direct(payload.target, payload.body)
+                # Start all UNSTARTED members before broadcasting
+                # so they subscribe to the event bus before the
+                # MessageEvent is published.
+                await agent.auto_start_all()
+                result = await inbox.broadcast(payload.body)
+                return result
+            # Start the targeted member before delivering the message
+            # so it subscribes to the event bus before MessageEvent
+            # is published. Startup failure does not prevent message
+            # persistence — the message stays in DB for later consumption.
+            await agent.auto_start_member(payload.target)
+            result = await inbox.direct(payload.target, payload.body)
+            return result
         if isinstance(payload, HumanAgentMessage):
             try:
+                if payload.target is not None:
+                    if payload.target in {"all", "*"}:
+                        await agent.auto_start_all()
+                    else:
+                        await agent.auto_start_member(payload.target)
                 inbox = HumanAgentInbox(
                     backend,
                     backend.message_manager,
@@ -396,7 +517,7 @@ class TeamRuntimeManager:
         backend = entry.agent.team_backend
         if backend is None:
             return False
-        backend.register_human_agent_inbound(member_name, callback)
+        await backend.register_human_agent_inbound(member_name, callback)
         return True
 
     async def stop_team(
@@ -408,6 +529,11 @@ class TeamRuntimeManager:
         """Tear down the active TeamAgent runtime; preserve persisted data."""
         entry = await self._resolve_entry(team_name=team_name, session_id=session_id)
         if entry is None:
+            team_logger.debug(
+                "stop_team: no pool entry for team {} session {}; nothing to stop",
+                team_name,
+                session_id,
+            )
             return False
         try:
             await entry.agent.stop_coordination()
@@ -419,6 +545,11 @@ class TeamRuntimeManager:
                 exc,
             )
         await self._pool.remove(team_name)
+        team_logger.info(
+            "stop_team: team {} session {} stopped and removed from pool",
+            team_name,
+            session_id,
+        )
         return True
 
     async def get_monitor(
@@ -671,9 +802,7 @@ class TeamRuntimeManager:
 
         if db_config is None:
             details = "; ".join(parse_errors) if parse_errors else "no parseable team bucket found"
-            raise RuntimeError(
-                f"Cannot resolve team session release info for {session_id}: {details}"
-            )
+            raise RuntimeError(f"Cannot resolve team session release info for {session_id}: {details}")
 
         return TeamSessionReleaseInfo(
             team_names=sorted(team_names),
@@ -701,7 +830,7 @@ class TeamRuntimeManager:
         spec: "TeamAgentSpec",
         team_session: AgentTeamSession,
         team_name: str,
-    ) -> tuple[bool, bool]:
+    ) -> tuple[bool, bool, Optional[str]]:
         """Inspect the session checkpoint and team table.
 
         ``team_in_session`` comes from the checkpoint bucket; ``team_in_db``
@@ -718,13 +847,15 @@ class TeamRuntimeManager:
         await team_session.pre_run()
         if not session_exists:
             team_in_session = False
+            team_db_state = None
         else:
             team_in_session = read_team_namespace(team_session, team_name) is not None
+            team_db_state = read_team_db_state(team_session, team_name)
 
         db = get_shared_db(spec.resolve_db_config())
         await db.initialize()
         team_in_db = await db.team.team_exists(team_name)
-        return team_in_session, team_in_db
+        return team_in_session, team_in_db, team_db_state
 
     async def _apply_action(
         self,

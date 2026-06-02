@@ -68,6 +68,9 @@ class TeamSkillRail(
     language: str = "cn",
     trajectory_store: Optional[TrajectoryStore] = None,
     team_trajectory_store: Optional[TrajectoryStore] = None,
+    trajectory_source: Optional[TrajectorySource] = None,
+    trajectory_sink: Optional[TrajectorySink] = None,
+    member_role: Optional[str] = None,
     auto_scan: bool = True,
     auto_save: bool = False,
     async_evolution: bool = True,
@@ -81,6 +84,7 @@ class TeamSkillRail(
     simplify_llm_policy: LLMInvokePolicy = ...,
     eval_interval: int = 5,
     evolution_total_timeout_secs: float = 600.0,
+    disabled_skills: Optional[Union[str, list[str]]] = None,
 )
 ```
 
@@ -91,7 +95,10 @@ class TeamSkillRail(
 * **model** (str): Model name.
 * **language** (str): Language setting.
 * **trajectory_store** (TrajectoryStore, optional): Trajectory store instance.
-* **team_trajectory_store** (TrajectoryStore, optional): Team trajectory store instance.
+* **team_trajectory_store** (TrajectoryStore, optional): Deprecated team trajectory store instance. Use `trajectory_source` / `trajectory_sink` for runtime aggregation.
+* **trajectory_source** (TrajectorySource, optional): Runtime source for aggregated member trajectory evidence.
+* **trajectory_sink** (TrajectorySink, optional): Runtime sink for publishing this member's latest trajectory snapshot.
+* **member_role** (str, optional): Role written to published snapshots. Defaults to `"leader"` for team skill evolution.
 * **auto_scan** (bool): Whether to detect passive team completion and trigger passive evolution, defaults to `True`.
 * **auto_save** (bool): Whether to auto-save generated experience records, defaults to `False` (requires user approval).
 * **async_evolution** (bool): Whether to execute evolution asynchronously, defaults to `True`.
@@ -105,6 +112,31 @@ class TeamSkillRail(
 * **simplify_llm_policy** (LLMInvokePolicy): Experience simplify LLM invocation policy.
 * **eval_interval** (int): Number of presentations between experience scoring checks. Must be at least 1.
 * **evolution_total_timeout_secs** (float): Background evolution total timeout budget, defaults to 600s.
+* **disabled_skills** (Optional[Union[str, list[str]]], optional): Deny-list of skill names excluded from self-optimization. Supports a single skill name (str) or multiple names (list[str]).
+
+### Runtime Trajectory Source/Sink
+
+`TeamSkillRail` uses `trajectory_source` and `trajectory_sink` for online team trajectory aggregation. A common setup is to pass the same `InMemoryTrajectoryRegistry` as both:
+
+```python
+from openjiuwen.agent_evolving.trajectory import InMemoryTrajectoryRegistry
+from openjiuwen.harness.rails import TeamSkillRail
+
+trajectory_registry = InMemoryTrajectoryRegistry()
+
+team_rail = TeamSkillRail(
+    skills_dir="/path/to/skills",
+    llm=model_client,
+    model="gpt-4",
+    team_id="research-team",
+    trajectory_source=trajectory_registry,
+    trajectory_sink=trajectory_registry,
+)
+```
+
+The rail publishes `MemberTrajectorySnapshot` values after invoke. Snapshots contain `team_id`, `session_id`, `member_id`, `member_role`, `trajectory`, and `recorded_at_ms`; they do not contain a public revision. `InMemoryTrajectoryRegistry` owns latest-snapshot ordering: newer `recorded_at_ms` wins, and equal timestamps are resolved by registry receive order.
+
+To aggregate multiple members, every rail or agent that should contribute evidence must publish to the same `trajectory_sink`; this rail then reads that shared registry through `trajectory_source`.
 
 ### Priority
 
@@ -129,6 +161,18 @@ Team skill experience optimizer.
 ### evolution_config -> dict
 
 Complete evolution configuration, including phase LLM invocation policies and timeout settings.
+
+---
+
+## Runtime Trajectory Methods
+
+### set_trajectory_source(source) -> None
+
+Bind or replace the runtime `TrajectorySource` used to aggregate team trajectory evidence.
+
+### set_trajectory_sink(sink, *, team_id, member_role=None) -> None
+
+Bind or replace the runtime `TrajectorySink` used to publish this rail's member snapshots. `team_id` is required when `sink` is not `None`. `member_role` defaults to `"leader"` for team skill evolution.
 
 ---
 
@@ -158,12 +202,12 @@ Stable ownership boundaries:
 
 Use `drain_pending_host_events()` as the canonical API to consume evolution events. `drain_pending_approval_events()` is a compatibility wrapper over the same buffer.
 
-Evolution metadata is carried in `OutputSchema.payload["_evolution_meta"]`:
+Evolution metadata is carried in `OutputSchema.payload["evolution_meta"]`:
 
 | Field | Meaning |
 |---|---|
 | `event_kind` | `approval`, `progress`, or `outcome`. |
-| `rail_kind` | Producing rail kind, usually `team-skill` for this rail. |
+| `rail_kind` | Producing rail kind, usually `team` for this rail. |
 | `stage` | Lifecycle stage for progress or outcome events. |
 | `skill_name` | Target team skill name. |
 | `request_id` | Approval or governance request id. |
@@ -172,6 +216,8 @@ Evolution metadata is carried in `OutputSchema.payload["_evolution_meta"]`:
 | `status` | Outcome status when available. |
 
 Approval events use `type="chat.ask_user_question"` and include `payload["request_id"]`. Progress events use `type="llm_reasoning"`. Background failures are reported as outcome events and do not fail the main invoke.
+
+`outcome` events are terminal machine-readable events. A normal no-op evolution run emits `status="no_evolution_no_records"` when the orchestrator completes successfully but produces no records. Hosts should not parse progress text to infer terminal state.
 
 ### Snapshot and signal boundaries
 
@@ -197,19 +243,19 @@ Trigger skill evolution (when all tasks complete).
 
 ---
 
-### async request_user_evolution(skill_name, user_intent, *, auto_approve=False) -> Optional[str]
+### async request_user_evolution(skill_name, user_intent="", *, auto_approve=False) -> EvolutionRequestResult
 
-User-initiated evolution request.
+User-initiated evolution request. The method trusts the provided `skill_name` as the evolution subject and uses the current rail trajectory, or the aggregated team trajectory from `trajectory_source`, as the evidence window; `user_intent` only adds direction.
 
 **Parameters**:
 
 * **skill_name** (str): Target skill name.
-* **user_intent** (str): User improvement intent description.
+* **user_intent** (str): User improvement intent description. Defaults to `""`; when empty, team trajectory evidence can still trigger evolution if it contains actionable signals.
 * **auto_approve** (bool): Whether to auto-approve, defaults to `False`.
 
 **Returns**:
 
-* `str`: request_id or `None` (when skill not found or no records generated).
+* `EvolutionRequestResult`: `request_id` is set when records were generated; otherwise an empty result object is returned.
 
 ---
 
@@ -324,6 +370,7 @@ Trajectory issue dataclass:
 ## Example
 
 ```python
+from openjiuwen.agent_evolving.trajectory import InMemoryTrajectoryRegistry
 from openjiuwen.harness.rails import TeamSkillCreateRail, TeamSkillRail
 from openjiuwen.harness import create_deep_agent
 
@@ -333,11 +380,16 @@ create_rail = TeamSkillCreateRail(
     min_team_members_for_create=2,
 )
 
+trajectory_registry = InMemoryTrajectoryRegistry()
+
 # Create team skill evolution rail
 team_rail = TeamSkillRail(
     skills_dir="/path/to/skills",
     llm=model_client,
     model="gpt-4",
+    team_id="research-team",
+    trajectory_source=trajectory_registry,
+    trajectory_sink=trajectory_registry,
     auto_save=False,
     async_evolution=True,
 )
@@ -351,18 +403,14 @@ agent = create_deep_agent(
 )
 
 # User requests evolution
-request_id = await team_rail.request_user_evolution(
+result = await team_rail.request_user_evolution(
     skill_name="research-team",
     user_intent="Add reviewer role, limit research time to 10 minutes",
 )
 
-# Get approval events
-events = await team_rail.drain_pending_approval_events(wait=True)
-for event in events:
-    if event.type == "chat.ask_user_question":
-        request_id = event.payload["request_id"]
-        # User approval
-        await team_rail.approve_record(request_id)
+# User approval
+if result.approval_event is not None:
+    await team_rail.approve_record(result.request_id)
 
 # Request simplify
 simplify_request_id = await team_rail.request_simplify("research-team")

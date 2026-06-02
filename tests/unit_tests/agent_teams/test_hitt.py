@@ -57,7 +57,7 @@ from openjiuwen.agent_teams.tools.database import (
     DatabaseType,
     TeamDatabase,
 )
-from openjiuwen.agent_teams.tools.team import TeamBackend
+from openjiuwen.agent_teams.tools.team import CapabilityOverrides, TeamBackend
 from openjiuwen.agent_teams.tools.team_tools import (
     HUMAN_AGENT_TOOLS,
     create_team_tools,
@@ -297,7 +297,7 @@ async def test_build_team_arg_enable_hitt_true_with_spec_false_raises(team_backe
             desc="y",
             leader_display_name="Leader",
             leader_desc="z",
-            enable_hitt=True,
+            overrides=CapabilityOverrides(enable_hitt=True),
         )
 
 
@@ -310,7 +310,7 @@ async def test_build_team_arg_enable_hitt_false_overrides_spec_true(hitt_team_ba
         desc="test",
         leader_display_name="Leader",
         leader_desc="Leader persona",
-        enable_hitt=False,
+        overrides=CapabilityOverrides(enable_hitt=False),
     )
     member = await db.member.get_member(HUMAN_AGENT_MEMBER_NAME, "hitt_team")
     assert member is None
@@ -470,7 +470,15 @@ async def test_cancel_all_preserves_human_agent_claimed_task(built_team, db):
 
 @pytest.mark.asyncio
 @pytest.mark.level0
-async def test_direct_message_to_human_agent_is_auto_read(built_team, db):
+async def test_direct_message_to_human_agent_stays_unread(built_team, db):
+    """Messages addressed to a human-agent must remain unread on write.
+
+    Human agents share the polling mailbox path with teammates — the
+    coordination MessageHandler drains unread messages and feeds them
+    into the avatar's DeepAgent via deliver_input. Auto-marking on write
+    used to pre-empt that path and prevent delivery; see
+    F_20_human-agent-mailbox-unread-flip.
+    """
     mm = built_team.message_manager
     msg_id = await mm.send_message(
         content="please review",
@@ -479,7 +487,7 @@ async def test_direct_message_to_human_agent_is_auto_read(built_team, db):
     assert msg_id is not None
     messages = await mm.get_messages(to_member_name=HUMAN_AGENT_MEMBER_NAME)
     assert len(messages) == 1
-    assert messages[0].is_read is True
+    assert messages[0].is_read is False
 
 
 @pytest.mark.asyncio
@@ -491,7 +499,7 @@ async def test_direct_message_to_regular_member_is_unread(team_backend, db):
         desc="t",
         leader_display_name="Leader",
         leader_desc="p",
-        enable_hitt=False,
+        overrides=CapabilityOverrides(enable_hitt=False),
     )
     from openjiuwen.core.single_agent.schema.agent_card import AgentCard
 
@@ -512,16 +520,22 @@ async def test_direct_message_to_regular_member_is_unread(team_backend, db):
 
 @pytest.mark.asyncio
 @pytest.mark.level0
-async def test_broadcast_auto_advances_human_agent_read_watermark(built_team, db):
+async def test_broadcast_to_human_agent_stays_unread(built_team, db):
+    """Broadcasts to a human-agent must remain unread on write.
+
+    Same rationale as the direct-message test — the polling mailbox path
+    is what delivers broadcasts into the avatar's DeepAgent. See
+    F_20_human-agent-mailbox-unread-flip.
+    """
     mm = built_team.message_manager
     msg_id = await mm.broadcast_message(content="global announcement")
     assert msg_id is not None
-    # human_agent's read_at must be set — unread-only fetch returns empty.
     unread = await mm.get_broadcast_messages(
         member_name=HUMAN_AGENT_MEMBER_NAME,
         unread_only=True,
     )
-    assert unread == []
+    assert len(unread) == 1
+    assert unread[0].message_id == msg_id
 
 
 # ---------------------------------------------------------------------------
@@ -577,7 +591,7 @@ async def test_human_agent_inbox_raises_when_hitt_off(team_backend, db):
         desc="t",
         leader_display_name="Leader",
         leader_desc="p",
-        enable_hitt=False,
+        overrides=CapabilityOverrides(enable_hitt=False),
     )
     inbox = HumanAgentInbox(team_backend, team_backend.message_manager)
     with pytest.raises(HumanAgentNotEnabledError):
@@ -679,9 +693,9 @@ async def multi_human_backend(db, messager):
 @pytest.mark.level0
 async def test_build_team_registers_every_declared_human_member(multi_human_backend, db):
     assert multi_human_backend.hitt_enabled() is True
-    assert multi_human_backend.is_human_agent("human_designer") is True
-    assert multi_human_backend.is_human_agent("human_pm") is True
-    assert multi_human_backend.is_human_agent("team_leader") is False
+    assert await multi_human_backend.is_human_agent("human_designer") is True
+    assert await multi_human_backend.is_human_agent("human_pm") is True
+    assert await multi_human_backend.is_human_agent("team_leader") is False
     # Both must be persisted as UNSTARTED members so the leader's
     # standard startup sweep brings up a real DeepAgent for each.
     for name in ("human_designer", "human_pm"):
@@ -692,28 +706,29 @@ async def test_build_team_registers_every_declared_human_member(multi_human_back
 
 @pytest.mark.asyncio
 @pytest.mark.level0
-async def test_direct_message_auto_read_for_every_human_member(multi_human_backend, db):
-    """send_message to any of the declared human members must auto-mark-read."""
+async def test_direct_message_to_every_human_member_stays_unread(multi_human_backend, db):
+    """send_message to any declared human member must stay unread on write."""
     mm = multi_human_backend.message_manager
     for name in ("human_designer", "human_pm"):
         msg_id = await mm.send_message(content=f"hi {name}", to_member_name=name)
         assert msg_id is not None
         messages = await mm.get_messages(to_member_name=name)
-        assert any(m.is_read for m in messages if m.to_member_name == name)
+        assert not any(m.is_read for m in messages if m.to_member_name == name)
 
 
 @pytest.mark.asyncio
 @pytest.mark.level0
-async def test_broadcast_auto_marks_read_for_every_human_member(
+async def test_broadcast_to_every_human_member_stays_unread(
     multi_human_backend,
 ):
-    """Broadcast advances every human member's read watermark."""
+    """Broadcast must remain unread for every human member on write."""
     mm = multi_human_backend.message_manager
     msg_id = await mm.broadcast_message(content="hello team")
     assert msg_id is not None
     for name in ("human_designer", "human_pm"):
         unread = await mm.get_broadcast_messages(member_name=name, unread_only=True)
-        assert unread == []
+        assert len(unread) == 1
+        assert unread[0].message_id == msg_id
 
 
 @pytest.mark.asyncio
@@ -1169,7 +1184,7 @@ async def test_hitt_enabled_reflects_capability_not_roster(db, messager):
         enable_hitt=True,
     )
     assert backend.hitt_enabled() is True
-    assert backend.human_agent_names() == frozenset()
+    assert await backend.human_agent_names() == frozenset()
 
 
 @pytest.mark.asyncio

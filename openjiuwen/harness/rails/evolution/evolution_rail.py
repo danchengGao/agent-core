@@ -16,15 +16,19 @@ Core design:
 from __future__ import annotations
 
 import asyncio
+import warnings
 from enum import Enum
-from typing import Any, List, Optional
+from typing import Any, List, Optional, Union
 
+from openjiuwen.agent_evolving.signal.from_conv import ConversationSignalDetector
 from openjiuwen.agent_evolving.trajectory import (
     InMemoryTrajectoryStore,
     LLMCallDetail,
+    MemberTrajectorySnapshot,
     ToolCallDetail,
     Trajectory,
     TrajectoryBuilder,
+    TrajectorySink,
     TrajectoryStep,
     TrajectoryStore,
 )
@@ -74,17 +78,30 @@ def _split_response_token_fields(
     return response_dict, prompt_token_ids, completion_token_ids, logprobs
 
 
-def _resolve_agent_member_role(agent: Any) -> Optional[str]:
-    """Return the team member role value from an agent when available."""
-    if agent is None:
+def _normalize_member_role(role: Any) -> Optional[str]:
+    """Return a stable string value for a team member role."""
+    if role is None:
         return None
-    role = getattr(agent, "role", None)
-    if callable(role):
-        role = role()
     role_value = getattr(role, "value", role)
     if role_value is None:
         return None
-    return str(role_value)
+    role_text = str(role_value)
+    return role_text or None
+
+
+def _normalize_skill_names(raw: Optional[Union[str, list[str]]]) -> set[str]:
+    """Normalize skill names into a set.
+
+    A string is treated as a single skill name; a list is treated as multiple names.
+    """
+    if raw is None:
+        return set()
+    if isinstance(raw, str):
+        name = raw.strip()
+        return {name} if name else set()
+    if isinstance(raw, list):
+        return {name.strip() for name in raw if name.strip()}
+    return set()
 
 
 class EvolutionTriggerPoint(Enum):
@@ -113,6 +130,7 @@ class EvolutionRail(DeepAgentRail):
     """
 
     priority = 60  # Lower than security rails, higher than user rails
+    _DEFAULT_MEMBER_ROLE: Optional[str] = None
 
     def __init__(
         self,
@@ -122,13 +140,14 @@ class EvolutionRail(DeepAgentRail):
         evolution_trigger: EvolutionTriggerPoint = EvolutionTriggerPoint.AFTER_INVOKE,
         async_evolution: bool = True,
         max_concurrent_evolution: int = 1,
+        disabled_skills: Optional[Union[str, list[str]]] = None,
     ):
         """Initialize EvolutionRail.
 
         Args:
             trajectory_store: Optional trajectory store. If None, uses InMemoryTrajectoryStore.
-            team_trajectory_store: Optional shared team trajectory store. When set,
-                each member's trajectory is also saved here for team-level aggregation.
+            team_trajectory_store: Deprecated shared team trajectory store. Passing it
+                emits a warning and no longer enables online dual-write aggregation.
             max_trajectory_steps: Optional maximum number of recent trajectory steps
                 retained in the cross-invoke builder window.
             evolution_trigger: When to automatically trigger run_evolution.
@@ -142,13 +161,24 @@ class EvolutionRail(DeepAgentRail):
                 with the active ctx (backward-compatible).
             max_concurrent_evolution: Max concurrent run_evolution executions.
                 Limits LLM competition with the main agent flow. Default is 1.
+            disabled_skills: Optional deny-list of skill names excluded from self-optimization.
+                Supports a single skill name (str) or multiple names (list[str]).
         """
         super().__init__()
+        if team_trajectory_store is not None:
+            warnings.warn(
+                "team_trajectory_store is deprecated; use trajectory_source/trajectory_sink instead",
+                DeprecationWarning,
+                stacklevel=2,
+            )
         self._trajectory_store = trajectory_store or InMemoryTrajectoryStore()
         self._builder: Optional[TrajectoryBuilder] = None
         self._max_trajectory_steps = max_trajectory_steps
         self._evolution_trigger = evolution_trigger
-        self._team_trajectory_store = team_trajectory_store
+        self._trajectory_sink: Optional[TrajectorySink] = None
+        self._disabled_skills: set[str] = _normalize_skill_names(disabled_skills)
+        self._team_id: Optional[str] = None
+        self._member_role: Optional[str] = None
 
         self._async_evolution = async_evolution
         self._bg_tasks: set[BackgroundTask] = set()
@@ -161,6 +191,16 @@ class EvolutionRail(DeepAgentRail):
         return self._trajectory_store
 
     @property
+    def disabled_skills(self) -> set[str]:
+        """Set of skill names excluded from self-optimization."""
+        return self._disabled_skills
+
+    @classmethod
+    def _normalize_name_set(cls, raw: Optional[Union[str, list[str]]]) -> set[str]:
+        """Normalize skill names into a set."""
+        return _normalize_skill_names(raw)
+
+    @property
     def builder(self) -> Optional[TrajectoryBuilder]:
         """Public accessor for the trajectory builder.
 
@@ -168,6 +208,21 @@ class EvolutionRail(DeepAgentRail):
         for custom evolution triggering outside of after_invoke.
         """
         return self._builder
+
+    def set_trajectory_sink(
+        self,
+        sink: Optional[TrajectorySink],
+        *,
+        team_id: Optional[str],
+        member_role: Optional[str] = None,
+    ) -> None:
+        """Bind this rail to a runtime trajectory sink."""
+        if sink is not None and not team_id:
+            raise ValueError("team_id is required when binding a trajectory sink")
+        self._trajectory_sink = sink
+        self._team_id = team_id
+        role = self._DEFAULT_MEMBER_ROLE if member_role is None else member_role
+        self._member_role = _normalize_member_role(role)
 
     # ---- Trajectory collection (final, subclasses should not override) ----
 
@@ -191,8 +246,7 @@ class EvolutionRail(DeepAgentRail):
         # Capture member_id for team trajectory aggregation
         agent_id = getattr(ctx.agent, "card", None)
         member_id = agent_id.id if agent_id else None
-        member_role = _resolve_agent_member_role(ctx.agent)
-        meta = {"member_role": member_role} if member_role else None
+        meta = {"member_role": self._member_role} if self._member_role else None
         self._builder = TrajectoryBuilder(
             session_id=session_id,
             source="online",
@@ -204,7 +258,7 @@ class EvolutionRail(DeepAgentRail):
             "[EvolutionRail] created trajectory builder session_id=%s, member_id=%s, member_role=%s",
             session_id,
             member_id,
-            member_role,
+            self._member_role,
         )
 
         # Trigger extension point for subclasses
@@ -231,8 +285,8 @@ class EvolutionRail(DeepAgentRail):
                 if config:
                     model_name = getattr(config, "model", None) or model_name
 
-            response_dict, prompt_token_ids, completion_token_ids, logprobs = (
-                _split_response_token_fields(inputs.response)
+            response_dict, prompt_token_ids, completion_token_ids, logprobs = _split_response_token_fields(
+                inputs.response
             )
 
             detail = LLMCallDetail(
@@ -263,9 +317,8 @@ class EvolutionRail(DeepAgentRail):
         await self._on_after_model_call(ctx)
 
         # Trigger evolution if configured
-        if (
-            self._evolution_trigger == EvolutionTriggerPoint.AFTER_MODEL_CALL
-            and self._allow_evolution_trigger(EvolutionTriggerPoint.AFTER_MODEL_CALL, ctx)
+        if self._evolution_trigger == EvolutionTriggerPoint.AFTER_MODEL_CALL and self._allow_evolution_trigger(
+            EvolutionTriggerPoint.AFTER_MODEL_CALL, ctx
         ):
             trajectory = self._build_trajectory()
             if trajectory is not None:
@@ -304,9 +357,8 @@ class EvolutionRail(DeepAgentRail):
         await self._on_after_tool_call(ctx)
 
         # Trigger evolution if configured
-        if (
-            self._evolution_trigger == EvolutionTriggerPoint.AFTER_TOOL_CALL
-            and self._allow_evolution_trigger(EvolutionTriggerPoint.AFTER_TOOL_CALL, ctx)
+        if self._evolution_trigger == EvolutionTriggerPoint.AFTER_TOOL_CALL and self._allow_evolution_trigger(
+            EvolutionTriggerPoint.AFTER_TOOL_CALL, ctx
         ):
             trajectory = self._build_trajectory()
             if trajectory is not None:
@@ -316,9 +368,8 @@ class EvolutionRail(DeepAgentRail):
         """Called after each task-loop iteration."""
         await self._on_after_task_iteration(ctx)
 
-        if (
-            self._evolution_trigger == EvolutionTriggerPoint.AFTER_TASK_ITERATION
-            and self._allow_evolution_trigger(EvolutionTriggerPoint.AFTER_TASK_ITERATION, ctx)
+        if self._evolution_trigger == EvolutionTriggerPoint.AFTER_TASK_ITERATION and self._allow_evolution_trigger(
+            EvolutionTriggerPoint.AFTER_TASK_ITERATION, ctx
         ):
             trajectory = self._build_trajectory()
             if trajectory is not None:
@@ -335,16 +386,14 @@ class EvolutionRail(DeepAgentRail):
 
         self._trajectory_store.save(trajectory)
 
-        if self._team_trajectory_store is not None:
-            self._team_trajectory_store.save(trajectory)
+        self._publish_trajectory_snapshot(trajectory)
 
         # Extension point: called after saving, before builder is cleared
         await self._on_after_invoke(ctx)
 
         # Trigger evolution if configured for after_invoke
-        if (
-            self._evolution_trigger == EvolutionTriggerPoint.AFTER_INVOKE
-            and self._allow_evolution_trigger(EvolutionTriggerPoint.AFTER_INVOKE, ctx)
+        if self._evolution_trigger == EvolutionTriggerPoint.AFTER_INVOKE and self._allow_evolution_trigger(
+            EvolutionTriggerPoint.AFTER_INVOKE, ctx
         ):
             await self._trigger_evolution(trajectory, ctx)
             await self._on_after_evolution_triggered(trajectory, ctx)
@@ -386,6 +435,24 @@ class EvolutionRail(DeepAgentRail):
     def _save_trajectory(self, trajectory: Trajectory) -> None:
         """Save trajectory to store."""
         self._trajectory_store.save(trajectory)
+
+    def _publish_trajectory_snapshot(self, trajectory: Trajectory) -> None:
+        sink = self._trajectory_sink
+        team_id = self._team_id
+        if sink is None or not team_id:
+            return
+        member_id = trajectory.meta.get("member_id")
+        if not member_id:
+            return
+        member_role = _normalize_member_role(trajectory.meta.get("member_role")) or self._member_role
+        sink.publish_member_trajectory(
+            MemberTrajectorySnapshot.make(
+                team_id=team_id,
+                member_id=str(member_id),
+                member_role=member_role,
+                trajectory=trajectory,
+            )
+        )
 
     async def _trigger_evolution(
         self,
@@ -520,10 +587,11 @@ class EvolutionRail(DeepAgentRail):
 
     @classmethod
     def _collect_messages_from_trajectory(cls, trajectory: Optional[Trajectory]) -> List[dict]:
-        """Derive message-like dicts from recorded LLM trajectory steps."""
+        """Derive message-like dicts from recorded trajectory steps."""
         if trajectory is None:
             return []
-        normalized = cls._normalize_callback_messages(trajectory.to_messages())
+        raw = ConversationSignalDetector.convert_trajectory_to_messages(trajectory)
+        normalized = cls._normalize_callback_messages(raw)
         deduped: List[dict] = []
         for message in normalized:
             if message not in deduped:
@@ -644,10 +712,15 @@ class EvolutionRail(DeepAgentRail):
         return events
 
     def _emit_background_outcome_event(self, outcome: dict[str, str]) -> None:
-        """Expose background evolution failures through the host-event buffer."""
+        """Expose background evolution outcomes through the host-event buffer."""
         meta = EvolutionHostEventMeta(
             event_kind="outcome",
-            rail_kind="base",
+            rail_kind=outcome.get("rail_kind", "base"),
+            stage=outcome.get("stage"),
+            skill_name=outcome.get("skill_name"),
+            request_id=outcome.get("request_id"),
+            signal_type=outcome.get("signal_type"),
+            source=outcome.get("source"),
             status=outcome["status"],
         )
         self.emit_host_event(
@@ -656,7 +729,7 @@ class EvolutionRail(DeepAgentRail):
                 index=0,
                 payload={
                     "content": f"[Evolution] {outcome['message']}\n",
-                    "_evolution_meta": meta.to_payload(),
+                    "evolution_meta": meta.to_payload(),
                 },
             )
         )

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import copy
 import asyncio
+import time
 from dataclasses import dataclass
 from typing import Any, AsyncIterator, Dict, List, Optional, Tuple, Union
 
@@ -624,6 +625,7 @@ class ReActAgent(BaseAgent):
             preview_messages.insert(0, SystemMessage(content=preview_system_prompt))
         return preview_messages
 
+
     async def _call_model(
             self,
             ctx: AgentCallbackContext,
@@ -652,8 +654,8 @@ class ReActAgent(BaseAgent):
 
         ai_message = await self._railed_model_call(ctx)
 
-        if ai_message is None:
-            return None
+        if not isinstance(ai_message, AssistantMessage):
+            return ai_message
 
         log_llm_response(logger, ai_message)
 
@@ -760,6 +762,10 @@ class ReActAgent(BaseAgent):
         # Streaming path: accumulate chunks via __add__, write to session in real-time
         accumulated_chunk = None
         chunk_index = 0
+        call_start_time = time.monotonic()
+        call_first_token_time = None
+        call_last_token_time = None
+        call_chunk_count = 0
 
         async for chunk in llm.stream(
                 model=self._config.model_name,
@@ -771,6 +777,11 @@ class ReActAgent(BaseAgent):
                 accumulated_chunk = chunk
             else:
                 accumulated_chunk = accumulated_chunk + chunk
+
+            if call_first_token_time is None:
+                call_first_token_time = time.monotonic()
+            call_last_token_time = time.monotonic()
+            call_chunk_count += 1
 
             if chunk.reasoning_content:
                 await session.write_stream(OutputSchema(
@@ -801,10 +812,25 @@ class ReActAgent(BaseAgent):
             )
         ctx.inputs.response = ai_message
         if ai_message.usage_metadata:
+
+            perf_metrics = {}
+            call_latency = (time.monotonic() - call_start_time) * 1000
+            perf_metrics["total_latency_ms"] = round(call_latency, 2)
+            if call_first_token_time is not None:
+                perf_metrics["ttft_ms"] = round((call_first_token_time - call_start_time) * 1000, 2)
+            if call_first_token_time is not None and call_last_token_time is not None and call_chunk_count > 1:
+                perf_metrics["tpot_ms"] = round(
+                    (call_last_token_time - call_first_token_time) / (call_chunk_count - 1) * 1000, 2
+                )
+
             await session.write_stream(OutputSchema(
                 type="llm_usage",
                 index=0,
-                payload={"usage_metadata": ai_message.usage_metadata.model_dump(), "result_type": "answer"},
+                payload={
+                    "usage_metadata": ai_message.usage_metadata.model_dump(),
+                    "result_type": "answer",
+                    **perf_metrics,
+                },
             ))
         return ai_message
 
@@ -858,22 +884,62 @@ class ReActAgent(BaseAgent):
 
         results = await self.ability_manager.execute(ctx=ctx, tool_call=tool_calls, session=session)
 
-        multimodal_messages: List[UserMessage] = []
         for tool_result, tool_message in results:
             if tool_message is not None:
                 await context.add_messages(tool_message)
 
-            multimodal_messages.extend(
-                self._build_multimodal_tool_result_messages(tool_result)
-            )
-
-        for multimodal_message in multimodal_messages:
+        multimodal_message = self._build_multimodal_tool_results_message(
+            tool_result for tool_result, _ in results
+        )
+        if multimodal_message is not None:
             await context.add_messages(multimodal_message)
 
         return results
 
     @staticmethod
     def _build_multimodal_tool_result_messages(tool_result: Any) -> List[UserMessage]:
+        message = ReActAgent._build_multimodal_tool_results_message([tool_result])
+        return [message] if message is not None else []
+
+    @staticmethod
+    def _build_multimodal_tool_results_message(tool_results: Any) -> Optional[UserMessage]:
+        content: List[dict[str, Any]] = []
+        loaded_paths: List[str] = []
+
+        for tool_result in tool_results:
+            for item in ReActAgent._iter_multimodal_image_items(tool_result):
+                source_path = str(item.get("source_path") or "unknown image")
+                data_url = item["data_url"]
+                loaded_paths.append(source_path)
+                content.append(
+                    {
+                        "type": "text",
+                        "text": f"Image loaded from read_file: {source_path}",
+                    }
+                )
+                content.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_url,
+                        },
+                    }
+                )
+
+        if not content:
+            return None
+
+        if len(loaded_paths) > 1:
+            summary_lines = [
+                "Images loaded by tool results:",
+                *[f"{index}. {path}" for index, path in enumerate(loaded_paths, start=1)],
+            ]
+            content.insert(0, {"type": "text", "text": "\n".join(summary_lines)})
+
+        return UserMessage(content=content)
+
+    @staticmethod
+    def _iter_multimodal_image_items(tool_result: Any) -> List[dict[str, Any]]:
         data = getattr(tool_result, "data", None)
         if not isinstance(data, dict):
             return []
@@ -882,7 +948,7 @@ class ReActAgent(BaseAgent):
         if not isinstance(multimodal_items, list):
             return []
 
-        messages: List[UserMessage] = []
+        image_items: List[dict[str, Any]] = []
         for item in multimodal_items:
             if not isinstance(item, dict) or item.get("type") != "image":
                 continue
@@ -891,25 +957,9 @@ class ReActAgent(BaseAgent):
             if not isinstance(data_url, str) or not data_url.startswith("data:image/"):
                 continue
 
-            source_path = str(item.get("source_path") or "unknown image")
-            messages.append(
-                UserMessage(
-                    content=[
-                        {
-                            "type": "text",
-                            "text": f"Image loaded from read_file: {source_path}",
-                        },
-                        {
-                            "type": "image_url",
-                            "image_url": {
-                                "url": data_url,
-                            },
-                        },
-                    ]
-                )
-            )
+            image_items.append(item)
 
-        return messages
+        return image_items
 
     def _is_interrupted(self, tool_result: Any) -> bool:
         """Detect whether a tool result signals workflow interruption."""
@@ -1355,6 +1405,10 @@ class ReActAgent(BaseAgent):
                             invoke_inputs.result = finish.result
                             break
 
+                        if not isinstance(ai_message, AssistantMessage):
+                            invoke_inputs.result = ai_message if isinstance(ai_message, dict) else {}
+                            break
+
                         await context.add_messages(
                             AssistantMessage(
                                 content=ai_message.content,
@@ -1408,14 +1462,17 @@ class ReActAgent(BaseAgent):
             # after_invoke rails have fired; return result (possibly adapted by rails via ctx.extra)
             return ctx.extra.get("invoke_result", invoke_inputs.result)
         except asyncio.CancelledError:
-            # Clear context messages to prevent stale messages from accumulating
-            # when cancelled requests leave behind partial state
+            # 外部取消（非工具级 CancelledError）。
+            # Fix 1 确保工具级 CancelledError 在 asyncio.gather 中被捕获并转为
+            # ToolMessage，不会传播到这里。此处只清理当前轮次的消息（工具调用请求 +
+            # 部分结果），保留历史对话上下文（with_history=False）。
             await self.clear_context_messages(session_id=session.get_session_id())
             raise  # Re-raise to propagate cancellation signal
         finally:
             if need_cleanup:
                 await self.context_engine.save_contexts(session)
-                await session.post_run()
+                await session.close_stream()
+                await session.commit()
 
     async def write_invoke_result_to_stream(
             self,
@@ -1491,8 +1548,12 @@ class ReActAgent(BaseAgent):
             )
             need_cleanup = True
 
-        # Only call pre_run/post_run for agent sessions, not workflow sessions
-        self.is_agent_session = hasattr(session, "pre_run") and hasattr(session, "post_run")
+        # Only manage agent-session stream lifecycle, not workflow sessions.
+        self.is_agent_session = (
+            hasattr(session, "pre_run")
+            and hasattr(session, "close_stream")
+            and hasattr(session, "commit")
+        )
         # self.is_agent_session = isinstance(session, AgentSession)
         if self.is_agent_session:
             await session.pre_run(
@@ -1524,7 +1585,8 @@ class ReActAgent(BaseAgent):
                 if need_cleanup:
                     await self.context_engine.save_contexts(session)
                 if self.is_agent_session:
-                    await session.post_run()
+                    await session.close_stream()
+                    await session.commit()
 
         if self.is_agent_session:
             # Agent sessions use stream_iterator for consuming output

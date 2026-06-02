@@ -44,13 +44,6 @@ class RecoveryManager:
 
         member_name = self._configurator.member_name
         team_logger.info("[{}] recovering team", member_name or "?")
-        # Rebuild the in-memory HITT roster from DB before any
-        # restart_teammate fan-out. ``build_context_from_db`` already
-        # reads ``role`` straight off the row, but other sync HITT
-        # consumers (rails, coordination handlers, prompt sections)
-        # still read this cache and would otherwise see an empty
-        # roster after a cold leader restart.
-        await team_backend.refresh_human_agent_roster()
         all_members = await team_backend.list_members()
         restarted: list[str] = []
 
@@ -70,7 +63,12 @@ class RecoveryManager:
         return restarted
 
     def persist_leader_config(self, session) -> None:
-        from openjiuwen.agent_teams.runtime.metadata import write_team_namespace
+        from openjiuwen.agent_teams.runtime.metadata import (
+            TEAM_DB_STATE_KEY,
+            TEAM_DB_STATE_PENDING_CREATE,
+            read_team_db_state,
+            write_team_namespace,
+        )
 
         spec = self._configurator.spec
         ctx = self._configurator.ctx
@@ -81,6 +79,7 @@ class RecoveryManager:
         payload: dict[str, Any] = {
             "spec": spec.model_dump(mode="json"),
             "context": ctx.model_dump(mode="json"),
+            TEAM_DB_STATE_KEY: read_team_db_state(session, team_name) or TEAM_DB_STATE_PENDING_CREATE,
         }
         allocator = self._configurator.model_allocator
         if allocator is not None:

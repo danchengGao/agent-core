@@ -4,13 +4,17 @@
 
 import os
 import shutil
+import subprocess
 import tempfile
+import unittest
+from unittest.mock import MagicMock
 
 import pytest
 import pytest_asyncio
 
 from openjiuwen.core.runner import Runner
 from openjiuwen.core.sys_operation import SysOperationCard, OperationMode, LocalWorkConfig
+from openjiuwen.core.sys_operation.cwd import set_workspace
 from openjiuwen.harness.tools import BashTool
 
 
@@ -57,8 +61,7 @@ async def test_echo(sys_op) -> None:
     tool = BashTool(sys_op)
     res = await tool.invoke({"command": "echo hello"})
     assert res.success is True
-    assert "hello" in res.data["stdout"]
-    assert res.data["exit_code"] == 0
+    assert "hello" in res.data["content"]
     assert res.error is None
 
 
@@ -67,7 +70,7 @@ async def test_exit_1_is_error(sys_op) -> None:
     tool = BashTool(sys_op)
     res = await tool.invoke({"command": "echo fail && exit 1"})
     assert res.success is False
-    assert res.data["exit_code"] == 1
+    assert res.data["content"].startswith("Exit code")
 
 
 # ── semantic exit codes ───────────────────────────────────────
@@ -76,9 +79,9 @@ async def test_exit_1_is_error(sys_op) -> None:
 async def test_grep_no_match_is_not_error(sys_op) -> None:
     tool = BashTool(sys_op)
     res = await tool.invoke({"command": "echo hello | grep nonexistent_pattern_xyz"})
+    # grep exits 1 on no match: treated as success, empty merged output.
     assert res.success is True
-    assert res.data["exit_code"] == 1
-    assert res.data["return_code_interpretation"] == "No matches found"
+    assert res.data["content"] == ""
 
 
 @pytest.mark.asyncio
@@ -86,20 +89,19 @@ async def test_grep_match_success(sys_op) -> None:
     tool = BashTool(sys_op)
     res = await tool.invoke({"command": "echo hello | grep hello"})
     assert res.success is True
-    assert res.data["exit_code"] == 0
-    assert "hello" in res.data["stdout"]
+    assert "hello" in res.data["content"]
 
 
-# ── silent command detection ──────────────────────────────────
+# ── silent command produces empty content ─────────────────────
 
 @pytest.mark.asyncio
-async def test_silent_flag(sys_op) -> None:
+async def test_silent_command_empty_content(sys_op) -> None:
     tool = BashTool(sys_op)
     workspace = tempfile.mkdtemp()
     try:
         res = await tool.invoke({"command": f"mkdir -p {workspace}/sub"})
         assert res.success is True
-        assert res.data["no_output_expected"] is True
+        assert res.data["content"] == ""
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
 
@@ -109,10 +111,25 @@ async def test_silent_flag(sys_op) -> None:
 @pytest.mark.asyncio
 async def test_destructive_warning_present(sys_op) -> None:
     tool = BashTool(sys_op)
-    # git commit --amend on a non-git dir will fail, but the warning should still be in data
-    res = await tool.invoke({"command": "git commit --amend -m test"})
-    assert res.data["destructive_warning"] is not None
-    assert "rewrite" in res.data["destructive_warning"].lower()
+    # Run the amend inside a throwaway repo via workdir so it can never rewrite
+    # the real repository HEAD; we only assert the destructive warning surfaces.
+    repo = tempfile.mkdtemp()
+    try:
+        for setup in (
+            ["git", "init", "-q"],
+            ["git", "config", "user.email", "t@e2e.local"],
+            ["git", "config", "user.name", "t"],
+            ["git", "commit", "--allow-empty", "-q", "-m", "init"],
+        ):
+            subprocess.run(
+                setup, cwd=repo, check=True,
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        # git commit --amend triggers a destructive warning, now prepended to content.
+        res = await tool.invoke({"command": "git commit --amend -m test", "workdir": repo})
+        assert "rewrite" in res.data["content"].lower()
+    finally:
+        shutil.rmtree(repo, ignore_errors=True)
 
 
 # ── injection blocked ────────────────────────────────────────
@@ -143,28 +160,6 @@ async def test_workdir_nonexistent_dir_fails(sys_op_sandboxed) -> None:
     res = await tool.invoke({"command": "echo hi", "workdir": missing})
     assert res.success is False
     assert res.error is not None
-
-
-# ── output truncation ─────────────────────────────────────────
-
-@pytest.mark.asyncio
-async def test_smart_truncation(sys_op) -> None:
-    tool = BashTool(sys_op)
-    py = "python" if os.name == "nt" else "python3"
-    res = await tool.invoke({
-        "command": f'{py} -c "print(\'x\' * 500)"',
-        "max_output_chars": 250,
-    })
-    assert res.success is True
-    assert "lines omitted" in res.data["stdout"]
-
-
-@pytest.mark.asyncio
-async def test_no_truncation_within_limit(sys_op) -> None:
-    tool = BashTool(sys_op)
-    res = await tool.invoke({"command": "echo hello", "max_output_chars": 8000})
-    assert res.success is True
-    assert "omitted" not in res.data["stdout"]
 
 
 # ── background execution ─────────────────────────────────────
@@ -245,10 +240,9 @@ async def test_large_output_persisted(sys_op) -> None:
         "max_output_chars": 1000,
     })
     assert res.success is True
-    assert res.data["persisted_output_path"] is not None
-    assert res.data["persisted_output_size"] > 0
-    # verify the file exists and has content
-    assert os.path.isfile(res.data["persisted_output_path"])
+    # large output is persisted and surfaced as a <persisted-output> preview.
+    assert "<persisted-output>" in res.data["content"]
+    assert "Output too large" in res.data["content"]
 
 
 @pytest.mark.asyncio
@@ -256,8 +250,20 @@ async def test_small_output_not_persisted(sys_op) -> None:
     tool = BashTool(sys_op)
     res = await tool.invoke({"command": "echo hello"})
     assert res.success is True
-    assert res.data["persisted_output_path"] is None
-    assert res.data["persisted_output_size"] is None
+    assert "<persisted-output>" not in res.data["content"]
+    assert "hello" in res.data["content"]
+
+
+# ── timeout surfaces collected output ─────────────────────────
+
+@pytest.mark.asyncio
+async def test_timeout_returns_collected_output(sys_op) -> None:
+    tool = BashTool(sys_op)
+    # echo runs first, then sleep blows the 1s timeout: the kill must not drop
+    # the output already collected before it.
+    res = await tool.invoke({"command": "echo partial; sleep 5", "timeout": 1})
+    assert res.success is False
+    assert "partial" in res.data["content"]
 
 
 # ── empty command ─────────────────────────────────────────────
@@ -268,3 +274,52 @@ async def test_empty_command(sys_op) -> None:
     res = await tool.invoke({"command": ""})
     assert res.success is False
     assert "empty" in res.error
+
+
+# ── history path construction ─────────────────────────────────
+
+class TestBashToolHistoryPath(unittest.TestCase):
+    """Unit tests for _build_history_path — no Runner required."""
+
+    def _make_session(self, session_id: str, agent_id: str | None = None) -> MagicMock:
+        mock = MagicMock()
+        mock.get_session_id.return_value = session_id
+        mock.agent_id.return_value = agent_id
+        return mock
+
+    def test_path_contains_agent_id_and_session_id(self):
+        """History path embeds both agent_id and session_id."""
+        session = self._make_session("sess_abc", agent_id="agent_xyz")
+        tool = BashTool(MagicMock())
+        path = tool._build_history_path(session)
+        assert "agent_xyz" in path
+        assert "sess_abc" in path
+        session.get_session_id.assert_called_once()
+
+    def test_default_agent_id_used_when_none(self):
+        """session.agent_id() returning None falls back to 'default'."""
+        session = self._make_session("s1", agent_id=None)
+        tool = BashTool(MagicMock())
+        path = tool._build_history_path(session)
+        assert "default" in path
+
+    def test_workspace_path_is_base_dir(self):
+        """Workspace ContextVar is used as the base directory."""
+        session = self._make_session("s1", agent_id="a")
+        workspace = tempfile.mkdtemp()
+        try:
+            set_workspace(workspace)
+            tool = BashTool(MagicMock())
+            path = tool._build_history_path(session)
+            assert path.startswith(os.path.realpath(workspace))
+            assert ".agent_history" in path
+        finally:
+            shutil.rmtree(workspace, ignore_errors=True)
+
+    def test_filename_pattern(self):
+        """Filename follows file_ops_{agent_id}_{session_id}.json pattern."""
+        session = self._make_session("sess123", agent_id="myagent")
+        tool = BashTool(MagicMock())
+        path = tool._build_history_path(session)
+        filename = os.path.basename(path)
+        assert filename == "file_ops_myagent_sess123.json"
